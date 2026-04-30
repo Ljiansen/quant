@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V3策略监控仪表盘</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; font-size: 14px; }
+a { color: inherit; text-decoration: none; }
+
+/* ---- 顶部导航 ---- */
+.header {
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+  position: sticky; top: 0; z-index: 100;
+}
+.header-left { display: flex; align-items: center; gap: 16px; }
+.logo { font-size: 18px; font-weight: 700; color: #e94560; letter-spacing: 1px; }
+.tabs { display: flex; gap: 4px; }
+.tab-btn {
+  padding: 6px 20px; border-radius: 4px; border: 1px solid #0f3460;
+  background: transparent; color: #aaa; cursor: pointer; font-size: 14px;
+  transition: all .2s;
+}
+.tab-btn.active { background: #e94560; border-color: #e94560; color: #fff; font-weight: 600; }
+.tab-btn:hover:not(.active) { background: #0f3460; color: #fff; }
+
+.header-right { display: flex; align-items: center; gap: 16px; font-size: 13px; color: #888; }
+.countdown { color: #e94560; font-weight: 600; }
+.refresh-btn {
+  padding: 5px 14px; border-radius: 4px; border: 1px solid #e94560;
+  background: transparent; color: #e94560; cursor: pointer; font-size: 13px;
+  transition: all .2s;
+}
+.refresh-btn:hover { background: #e94560; color: #fff; }
+
+/* ---- 主内容 ---- */
+.main { padding: 20px 24px; max-width: 1600px; margin: 0 auto; }
+
+/* ---- 概览卡片 ---- */
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+.card {
+  background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+  padding: 18px 20px;
+}
+.card-label { font-size: 12px; color: #888; margin-bottom: 8px; text-transform: uppercase; letter-spacing: .5px; }
+.card-value { font-size: 24px; font-weight: 700; color: #e0e0e0; }
+.card-sub { font-size: 13px; color: #888; margin-top: 4px; }
+.profit-up { color: #ff4444 !important; }
+.profit-down { color: #00c853 !important; }
+
+/* ---- 区块面板 ---- */
+.panel { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; margin-bottom: 20px; }
+.panel-header {
+  padding: 14px 20px; border-bottom: 1px solid #0f3460;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.panel-title { font-size: 15px; font-weight: 600; color: #e0e0e0; }
+.panel-badge { font-size: 12px; color: #888; background: #0f3460; padding: 2px 8px; border-radius: 10px; }
+.panel-body { padding: 0; overflow: auto; }
+
+/* ---- 表格 ---- */
+table { width: 100%; border-collapse: collapse; }
+th {
+  padding: 10px 14px; text-align: left; font-size: 12px;
+  color: #888; font-weight: 600; background: #1a1a2e;
+  border-bottom: 1px solid #0f3460; white-space: nowrap;
+}
+td {
+  padding: 9px 14px; border-bottom: 1px solid #0f3460;
+  font-size: 13px; white-space: nowrap;
+}
+tr:last-child td { border-bottom: none; }
+tr:nth-child(even) td { background: rgba(15,52,96,.25); }
+tr:hover td { background: rgba(233,69,96,.08); }
+
+.empty-row td { text-align: center; color: #555; padding: 28px; }
+
+/* ---- 方向标签 ---- */
+.dir-buy { color: #ff4444; font-weight: 600; }
+.dir-sell { color: #00c853; font-weight: 600; }
+.reason-buy      { color: #00e676; font-weight: 600; }
+.reason-trailing { color: #ff9800; font-weight: 600; }
+.reason-hard     { color: #ff5252; font-weight: 600; }
+.reason-soft     { color: #ffb300; font-weight: 600; }
+.reason-time     { color: #90a4ae; font-weight: 600; }
+.reason-other    { color: #aaa; }
+.trail-active    { color: #26a69a; font-size: 10px; line-height: 1.2; display: block; }
+.trail-inactive  { color: #666; font-size: 10px; line-height: 1.2; display: block; }
+
+/* ---- 板块标签 ---- */
+.tag {
+  display: inline-block; padding: 1px 7px; border-radius: 3px;
+  font-size: 11px; font-weight: 600;
+}
+.tag-star { background: rgba(255,68,68,.15); color: #ff6666; border: 1px solid #ff4444; }
+.tag-gem  { background: rgba(255,165,0,.15);  color: #ffaa44; border: 1px solid #ff8c00; }
+.tag-main { background: rgba(0,200,83,.15);   color: #44dd88; border: 1px solid #00c853; }
+
+/* ---- 候选买入状态标签 ---- */
+.status-buy  { color: #00e676; font-weight: 700; }
+.status-stop { color: #ff4444; }
+.status-dim  { color: #ff9800; }
+.status-none { color: #555; }
+.chg-up { color: #ff4444; font-weight: 600; }
+.chg-dn { color: #00c853; font-weight: 600; }
+.chg-na { color: #555; }
+.stock-name { display: block; font-size: 11px; color: #888; margin-top: 2px; font-weight: normal; }
+
+/* ---- 进程监控栏 ---- */
+.proc-bar {
+  background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+  padding: 10px 20px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+}
+.proc-bar-title { font-size: 12px; color: #888; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; margin-right: 4px; }
+.proc-item { display: flex; align-items: center; gap: 8px; }
+.proc-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  transition: background .4s;
+}
+.proc-dot-run  { background: #00e676; box-shadow: 0 0 6px #00e676; }
+.proc-dot-stop { background: #555; }
+.proc-dot-busy { background: #ffab40; animation: blink .6s infinite alternate; }
+@keyframes blink { from { opacity: 1; } to { opacity: .2; } }
+.proc-name { font-size: 13px; font-weight: 600; color: #e0e0e0; }
+.proc-pid  { font-size: 11px; color: #888; }
+.proc-status-text { font-size: 12px; }
+.proc-status-run  { color: #00e676; }
+.proc-status-stop { color: #555; }
+.proc-btn {
+  padding: 3px 12px; border-radius: 4px; border: 1px solid; font-size: 12px;
+  cursor: pointer; transition: all .2s; font-weight: 600;
+}
+.proc-btn-start { border-color: #00e676; color: #00e676; background: transparent; }
+.proc-btn-start:hover { background: #00e676; color: #0a0a0a; }
+.proc-btn-stop  { border-color: #ff4444; color: #ff4444; background: transparent; }
+.proc-btn-stop:hover  { background: #ff4444; color: #fff; }
+.proc-btn:disabled { opacity: .4; cursor: not-allowed; }
+.proc-msg { font-size: 11px; color: #888; margin-left: 4px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- 参数表 ---- */
+.config-table th:first-child { width: 180px; }
+.config-table td:first-child { color: #aaa; }
+
+/* ---- 两列布局 ---- */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+
+@media(max-width:900px){
+  .cards { grid-template-columns: repeat(2,1fr); }
+  .two-col { grid-template-columns: 1fr; }
+}
+@media(max-width:560px){
+  .cards { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- 顶部导航 -->
+<div class="header">
+  <div class="header-left">
+    <span class="logo">▲ V3策略仪表盘</span>
+    <div class="tabs">
+      <button class="tab-btn"        id="tab-sim" onclick="switchMode('sim')">模拟盘</button>
+      <button class="tab-btn active" id="tab-live" onclick="switchMode('live')">实盘</button>
+    </div>
+  </div>
+  <div class="header-right">
+    <span>自动刷新: <span class="countdown" id="countdown">30</span>s</span>
+    <button class="refresh-btn" onclick="refreshAll()">立即刷新</button>
+  </div>
+</div>
+
+<!-- 主内容 -->
+<div class="main">
+
+<!-- 进程监控栏 -->
+  <div class="proc-bar" id="proc-bar">
+    <span class="proc-bar-title">&#9881; 进程监控</span>
+    <!-- 模拟盘 -->
+    <div class="proc-item">
+      <div class="proc-dot proc-dot-stop" id="proc-dot-sim"></div>
+      <span class="proc-name">模拟盘</span>
+      <span class="proc-status-text proc-status-stop" id="proc-status-sim">已停止</span>
+      <span class="proc-pid" id="proc-pid-sim"></span>
+      <button class="proc-btn proc-btn-start" id="proc-btn-start-sim" onclick="procStart('sim')">&#9654; 启动</button>
+      <button class="proc-btn proc-btn-stop"  id="proc-btn-stop-sim"  onclick="procStop('sim')" style="display:none">■ 停止</button>
+    </div>
+    <div style="width:1px;height:28px;background:#0f3460;"></div>
+    <!-- 实盘 -->
+    <div class="proc-item">
+      <div class="proc-dot proc-dot-stop" id="proc-dot-live"></div>
+      <span class="proc-name">实盘</span>
+      <span class="proc-status-text proc-status-stop" id="proc-status-live">已停止</span>
+      <span class="proc-pid" id="proc-pid-live"></span>
+      <button class="proc-btn proc-btn-start" id="proc-btn-start-live" onclick="procStart('live')">&#9654; 启动</button>
+      <button class="proc-btn proc-btn-stop"  id="proc-btn-stop-live"  onclick="procStop('live')" style="display:none">■ 停止</button>
+    </div>
+    <span class="proc-msg" id="proc-msg"></span>
+  </div>
+
+  <!-- 模块A: 概览卡片 -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">总资产</div>
+      <div class="card-value" id="c-total">--</div>
+      <div class="card-sub">初始资金: <span id="c-init">--</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">可用现金</div>
+      <div class="card-value" id="c-cash">--</div>
+      <div class="card-sub">持仓市值: <span id="c-pos-val">--</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">累计盈亏</div>
+      <div class="card-value" id="c-profit">--</div>
+      <div class="card-sub"><span id="c-profit-pct">--</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">最后更新</div>
+      <div class="card-value" id="c-update" style="font-size:16px;">--</div>
+      <div class="card-sub" id="c-mode-label">模拟盘</div>
+    </div>
+  </div>
+
+  <!-- 模块B: 当前持仓 -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">当前持仓</span>
+      <span class="panel-badge" id="pos-count">0 只</span>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead>
+          <tr>
+            <th>代码</th><th>板块</th><th>买入价</th><th>持仓数量</th>
+            <th>持仓市值</th><th>盈亏%</th><th>持仓天数</th>
+            <th>止损线</th><th>移动止盈触发</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody id="pos-tbody">
+          <tr class="empty-row"><td colspan="10">暂无持仓</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 模块C+D: 两列 -->
+  <div class="two-col">
+    <!-- 候选买入 -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">候选买入</span>
+        <span class="panel-badge" id="cand-count">0 只</span>
+      </div>
+      <div class="panel-body">
+        <table>
+          <thead><tr>
+            <th>代码</th><th>板块</th><th>当前价</th>
+            <th>涨跌幅%</th><th>收阳</th><th>买入阈値</th><th>状态</th>
+          </tr></thead>
+          <tbody id="cand-tbody">
+            <tr class="empty-row"><td colspan="7">暂无候选</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 即将卖出 -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">即将卖出</span>
+        <span class="panel-badge" id="sell-count">0 只</span>
+      </div>
+      <div class="panel-body">
+        <table>
+          <thead>
+            <tr><th>代码</th><th>卖出原因</th><th>买入价</th><th>持仓天数</th><th>执行方式</th></tr>
+          </thead>
+          <tbody id="sell-tbody">
+            <tr class="empty-row"><td colspan="5">暂无待卖出</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模块E: 历史交易 -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">历史交易记录</span>
+      <span class="panel-badge" id="trade-count">0 条</span>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th><th>代码</th><th>方向</th><th>价格</th>
+            <th>数量</th><th>金额</th><th>手续费</th><th>原因</th><th>交易后现金</th>
+          </tr>
+        </thead>
+        <tbody id="trade-tbody">
+          <tr class="empty-row"><td colspan="9">暂无交易记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 模块F: 策略参数 -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">策略参数</span>
+    </div>
+    <div class="panel-body">
+      <table class="config-table">
+        <thead>
+          <tr>
+            <th>参数</th>
+            <th>主板 (60/00)</th>
+            <th>科创/创业板 (688/30)</th>
+          </tr>
+        </thead>
+        <tbody id="cfg-tbody">
+          <tr class="empty-row"><td colspan="3">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+// ==================== 全局状态 ====================
+let currentMode = 'live';
+let countdownVal = 30;
+let countdownTimer = null;
+let refreshTimer = null;
+let configData = null;   // 缓存配置，用于持仓表动态止盈计算
+
+// ==================== 工具函数 ====================
+function fmt(n, dec=2) {
+  if (n === null || n === undefined || n === '') return '--';
+  return Number(n).toLocaleString('zh-CN', {minimumFractionDigits: dec, maximumFractionDigits: dec});
+}
+
+function fmtPct(n) {
+  if (n === null || n === undefined || n === '') return '--';
+  const v = Number(n);
+  return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+}
+
+function boardTag(code) {
+  const c = String(code).replace(/\.\w+$/, '');
+  if (c.startsWith('688')) return '<span class="tag tag-star">科创板</span>';
+  if (c.startsWith('30'))  return '<span class="tag tag-gem">创业板</span>';
+  return '<span class="tag tag-main">主板</span>';
+}
+
+function isStar(code) {
+  const c = String(code).replace(/\.\w+$/, '');
+  return c.startsWith('688') || c.startsWith('30');
+}
+
+const REASON_MAP = {
+  hard_stop:      '硬止损',
+  soft_stop:      '阴跌止损',
+  trailing_stop:  '移动止盈',
+  take_profit:    '固定止盈',
+  time_stop:      '时间止损',
+  buy_signal:     '动量买入',
+  rebalance:      '调仓'
+};
+function reasonCN(r) {
+  return REASON_MAP[r] || r || '--';
+}
+function reasonTag(r) {
+  const label = reasonCN(r);
+  let cls = 'reason-other';
+  if (r === 'buy_signal' || r === 'rebalance') cls = 'reason-buy';
+  else if (r === 'trailing_stop') cls = 'reason-trailing';
+  else if (r === 'hard_stop')     cls = 'reason-hard';
+  else if (r === 'soft_stop')     cls = 'reason-soft';
+  else if (r === 'time_stop')     cls = 'reason-time';
+  return `<span class="${cls}">${label}</span>`;
+}
+
+// ==================== Tab切换 ====================
+function switchMode(mode) {
+  currentMode = mode;
+  document.getElementById('tab-sim').classList.toggle('active', mode === 'sim');
+  document.getElementById('tab-live').classList.toggle('active', mode === 'live');
+  document.getElementById('c-mode-label').textContent = mode === 'sim' ? '模拟盘' : '实盘';
+  refreshAll();
+}
+
+// ==================== 刷新所有 ====================
+function refreshAll() {
+  loadStatus();
+  loadTrades();
+  loadCandidates();
+  loadConfig();
+  loadProcesses();
+  resetCountdown();
+}
+
+// ==================== 倒计时 ====================
+function resetCountdown() {
+  countdownVal = 30;
+  document.getElementById('countdown').textContent = countdownVal;
+}
+
+function startCountdown() {
+  if (countdownTimer) clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    countdownVal--;
+    document.getElementById('countdown').textContent = countdownVal;
+    if (countdownVal <= 0) {
+      refreshAll();
+    }
+  }, 1000);
+}
+
+// ==================== API调用 ====================
+async function fetchJSON(url) {
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch(e) {
+    console.warn('fetch failed:', url, e);
+    return null;
+  }
+}
+
+// ---- 状态 ----
+async function loadStatus() {
+  const data = await fetchJSON('/api/status?mode=' + currentMode);
+  if (!data) return;
+
+  document.getElementById('c-total').textContent = '¥' + fmt(data.total_value);
+  document.getElementById('c-cash').textContent  = '¥' + fmt(data.cash);
+  document.getElementById('c-init').textContent  = '¥' + fmt(data.initial_capital);
+
+  const posVal = (data.total_value || 0) - (data.cash || 0);
+  document.getElementById('c-pos-val').textContent = '¥' + fmt(posVal);
+
+  const profitEl = document.getElementById('c-profit');
+  const profitPctEl = document.getElementById('c-profit-pct');
+  profitEl.textContent = (data.profit >= 0 ? '+' : '') + '¥' + fmt(data.profit);
+  profitEl.className = 'card-value ' + (data.profit >= 0 ? 'profit-up' : 'profit-down');
+  profitPctEl.textContent = fmtPct(data.profit_pct);
+  profitPctEl.className = data.profit >= 0 ? 'profit-up' : 'profit-down';
+
+  document.getElementById('c-update').textContent = data.last_update || '--';
+
+  // 持仓表
+  renderPositions(data.positions || [], data);
+  // 即将卖出
+  renderPendingSells(data.pending_sells || [], data.positions || []);
+}
+
+function renderPositions(positions, statusData) {
+  const tbody = document.getElementById('pos-tbody');
+  document.getElementById('pos-count').textContent = positions.length + ' 只';
+  if (!positions.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="10">暂无持仓</td></tr>';
+    return;
+  }
+  tbody.innerHTML = positions.map(p => {
+    const code = p.code || p.stock_code || '';
+    const name = p.name || '';
+    const buyPrice = p.buy_price || p.cost || 0;
+    const qty = p.quantity || p.volume || 0;
+    const intendedQty = p.intended_qty || 0;
+    const isPartial = intendedQty > 0 && intendedQty > qty;
+    const qtyHtml = isPartial
+      ? `<span style="color:#ff9800;font-weight:600">${qty.toLocaleString()}</span>`
+        + `<small style="color:#ff9800;font-size:10px;display:block">计划${intendedQty.toLocaleString()}股 ⚠️部分成交</small>`
+      : qty.toLocaleString();
+    const curPrice = p.current_price || null;
+    const mktVal = curPrice ? curPrice * qty : buyPrice * qty;
+    const days = p.days_held || p.hold_days || p.days || 0;
+    const star = isStar(code);
+    const isKC  = String(code).replace(/\.\w+$/, '').startsWith('688'); // 科创板
+    const stopLoss  = buyPrice * (1 - 0.05);
+    // 使用全局 configData（若尚未加载则用默认值）
+    const trailAct = configData
+      ? (isKC ? (configData.star_board.trailing_activate || 0.08) : (configData.main_board.trailing_activate || 0.03))
+      : (isKC ? 0.08 : 0.03);
+    const trailPct = configData
+      ? (isKC ? (configData.star_board.trailing_stop || 0.05) : (configData.main_board.trailing_stop || 0.02))
+      : (isKC ? 0.05 : 0.02);
+    const highestPrice     = p.highest_price || buyPrice;
+    const activateThreshold = buyPrice * (1 + trailAct);
+    let trailCell;
+    if (highestPrice >= activateThreshold) {
+      const triggerPrice = highestPrice * (1 - trailPct);
+      trailCell = `<span class="profit-up">${fmt(triggerPrice)}</span>`
+        + `<small class="trail-active">↑最高${fmt(highestPrice)} 追踪中</small>`;
+    } else {
+      trailCell = `<span style="color:#888">${fmt(activateThreshold)}</span>`
+        + `<small class="trail-inactive">待激活 浮盈超${(trailAct*100).toFixed(0)}%开始追踪</small>`;
+    }
+    const status = p.status || '持仓中';
+    const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
+    let pnlHtml;
+    if (curPrice && buyPrice) {
+      const pnlPct = (curPrice - buyPrice) / buyPrice * 100;
+      const pnlCls = pnlPct >= 0 ? 'profit-up' : 'profit-down';
+      pnlHtml = `<span class="${pnlCls}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</span>`;
+    } else {
+      pnlHtml = '<span style="color:#555">--</span>';
+    }
+
+    return `<tr>
+      <td><b>${code}</b>${nameHtml}</td>
+      <td>${boardTag(code)}</td>
+      <td>${fmt(buyPrice)}</td>
+      <td>${qtyHtml}</td>
+      <td>¥${fmt(mktVal)}</td>
+      <td>${pnlHtml}</td>
+      <td>${days} 天</td>
+      <td>${fmt(stopLoss)}</td>
+      <td>${trailCell}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderPendingSells(pendingSells, positions) {
+  const tbody = document.getElementById('sell-tbody');
+  document.getElementById('sell-count').textContent = pendingSells.length + ' 只';
+  if (!pendingSells.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">暂无待卖出</td></tr>';
+    return;
+  }
+  // 构建持仓map
+  const posMap = {};
+  (positions || []).forEach(p => {
+    const code = p.code || p.stock_code || '';
+    posMap[code] = p;
+  });
+
+  tbody.innerHTML = pendingSells.map(s => {
+    const code = s.code || s.stock_code || '';
+    const name = s.name || '';
+    const reason = s.reason || s.sell_reason || '';
+    const pos = posMap[code] || {};
+    const buyPrice = s.buy_price || pos.buy_price || pos.cost || '--';
+    const days = s.hold_days || pos.hold_days || pos.days || '--';
+    const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
+    return `<tr>
+      <td><b>${code}</b>${nameHtml}</td>
+      <td>${reasonTag(reason)}</td>
+      <td>${buyPrice !== '--' ? fmt(buyPrice) : '--'}</td>
+      <td>${days}${days !== '--' ? ' 天' : ''}</td>
+      <td>次日集合竞价</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---- 交易记录 ----
+async function loadTrades() {
+  const data = await fetchJSON('/api/trades?mode=' + currentMode + '&limit=100');
+  const tbody = document.getElementById('trade-tbody');
+  if (!data || !data.length) {
+    document.getElementById('trade-count').textContent = '0 条';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="9">暂无交易记录</td></tr>';
+    return;
+  }
+  document.getElementById('trade-count').textContent = data.length + ' 条';
+  tbody.innerHTML = data.map(t => {
+    const action = t.action || t.direction || t.type || '';
+    const isBuy = action === 'buy';
+    const dirLabel = isBuy
+      ? '<span class="dir-buy">买入</span>'
+      : '<span class="dir-sell">卖出</span>';
+    const code = t.code || t.stock_code || '';
+    const name = t.name || '';
+    const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
+    const price = t.price || 0;
+    const qty = t.quantity || t.volume || 0;
+    const amount = t.amount || (price * qty);
+    const commission = t.commission || t.fee || 0;
+    const reason = t.reason || t.sell_reason || '';
+    const cash = t.cash_after || t.remaining_cash || '';
+    const time = t.time || t.timestamp || t.date || '';
+    return `<tr>
+      <td>${time}</td>
+      <td><b>${code}</b>${nameHtml}</td>
+      <td>${dirLabel}</td>
+      <td>${fmt(price)}</td>
+      <td>${qty.toLocaleString()}</td>
+      <td>¥${fmt(amount)}</td>
+      <td>¥${fmt(commission)}</td>
+      <td>${reasonTag(reason)}</td>
+      <td>${cash !== '' ? '¥' + fmt(cash) : '--'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---- 候选买入 ----
+async function loadCandidates() {
+  const data = await fetchJSON('/api/candidates?mode=' + currentMode);
+  const tbody = document.getElementById('cand-tbody');
+  if (!data || !data.candidates || !data.candidates.length) {
+    document.getElementById('cand-count').textContent = '0 只';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="7">暂无候选</td></tr>';
+    return;
+  }
+  document.getElementById('cand-count').textContent = data.candidates.length + ' 只';
+  tbody.innerHTML = data.candidates.map(c => {
+    const code = c.code || '';
+    const name = c.name || '';
+    const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
+    const pct  = c.change_pct;
+    const pctStr = pct !== null && pct !== undefined
+      ? '<span class="' + (pct >= 0 ? 'chg-up' : 'chg-dn') + '">' + (pct >= 0 ? '+' : '') + Number(pct).toFixed(2) + '%</span>'
+      : '<span class="chg-na">--</span>';
+    const priceStr = c.last_price !== null && c.last_price !== undefined ? Number(c.last_price).toFixed(2) : '--';
+    const yangStr  = c.is_positive === null || c.is_positive === undefined ? '--' : (c.is_positive ? '✅' : '❌');
+    const threshStr = (c.buy_threshold !== null && c.buy_threshold !== undefined) ? '>' + c.buy_threshold + '%' : '--';
+    let statusCls = 'status-none', statusText = c.status || '无行情';
+    if (statusText === '可买入') statusCls = 'status-buy';
+    else if (statusText === '涨停') statusCls = 'status-stop';
+    else if (statusText === '涨幅不足' || statusText === '收阴') statusCls = 'status-dim';
+    const rowStyle = c.meets_buy_condition ? ' style="background:rgba(0,230,118,.06);"' : '';
+    return `<tr${rowStyle}>
+      <td><b>${code}</b>${nameHtml}</td>
+      <td>${boardTag(code)}</td>
+      <td>${priceStr}</td>
+      <td>${pctStr}</td>
+      <td>${yangStr}</td>
+      <td>${threshStr}</td>
+      <td><span class="${statusCls}">${statusText}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ---- 策略参数 ----
+async function loadConfig() {
+  const data = await fetchJSON('/api/config');
+  const tbody = document.getElementById('cfg-tbody');
+  if (!data || data.error) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="3">参数加载失败</td></tr>';
+    return;
+  }
+  configData = data;   // 缓存全局，供 renderPositions 使用
+  const m = data.main_board || {};
+  const s = data.star_board || {};
+  const g = data.general || {};
+
+  const rows = [
+    ['买入涨幅',      '>' + pctStr(m.min_change_pct),              '>' + pctStr(s.min_change_pct)],
+    ['移动止盈激活',    '+' + pctStr(m.trailing_activate || 0.03),   '+' + pctStr(s.trailing_activate || 0.08)],
+    ['移动止盈回撤',    '-' + pctStr(m.trailing_stop     || 0.02),   '-' + pctStr(s.trailing_stop     || 0.05)],
+    ['硬止损',          '-' + pctStr(m.hard_stop_loss),              '-' + pctStr(s.hard_stop_loss)],
+    ['阴跌止损',        '-' + pctStr(m.soft_stop_loss),              '-' + pctStr(s.soft_stop_loss)],
+    ['时间止损',        (m.time_stop_days || '--') + ' 天',           (s.time_stop_days || '--') + ' 天'],
+    ['涨停保护',         pctStr(m.limit_up),                          pctStr(s.limit_up)],
+    ['最大持仓数', (g.max_positions || '--') + ' 只', '—'],
+    ['选股池大小', (g.top_n || '--') + ' 只',         '—'],
+    ['买入时间',   g.buy_time || '--',               '—'],
+  ];
+
+  tbody.innerHTML = rows.map((r, i) =>
+    `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`
+  ).join('');
+}
+
+function pctStr(v) {
+  if (v === null || v === undefined) return '--';
+  return (Number(v) * 100).toFixed(1) + '%';
+}
+
+// ==================== 进程监控 ====================
+async function loadProcesses() {
+  const data = await fetchJSON('/api/processes');
+  if (!data) return;
+  ['sim', 'live'].forEach(mode => {
+    const info = data[mode];
+    if (!info) return;
+    const running = info.running;
+    const pid = info.pid;
+    const dot    = document.getElementById('proc-dot-' + mode);
+    const status = document.getElementById('proc-status-' + mode);
+    const pidEl  = document.getElementById('proc-pid-' + mode);
+    const btnStart = document.getElementById('proc-btn-start-' + mode);
+    const btnStop  = document.getElementById('proc-btn-stop-' + mode);
+    if (running) {
+      dot.className = 'proc-dot proc-dot-run';
+      status.textContent = '运行中';
+      status.className = 'proc-status-text proc-status-run';
+      pidEl.textContent = pid ? 'PID ' + pid : '';
+      btnStart.style.display = 'none';
+      btnStop.style.display  = '';
+    } else {
+      dot.className = 'proc-dot proc-dot-stop';
+      status.textContent = '已停止';
+      status.className = 'proc-status-text proc-status-stop';
+      pidEl.textContent = '';
+      btnStart.style.display = '';
+      btnStop.style.display  = 'none';
+    }
+  });
+}
+
+function _setProcBusy(mode, busy) {
+  const btnStart = document.getElementById('proc-btn-start-' + mode);
+  const btnStop  = document.getElementById('proc-btn-stop-' + mode);
+  const dot = document.getElementById('proc-dot-' + mode);
+  if (busy) {
+    if (btnStart) btnStart.disabled = true;
+    if (btnStop)  btnStop.disabled  = true;
+    if (dot) dot.className = 'proc-dot proc-dot-busy';
+  } else {
+    if (btnStart) btnStart.disabled = false;
+    if (btnStop)  btnStop.disabled  = false;
+  }
+}
+
+function _showProcMsg(msg, ok) {
+  const el = document.getElementById('proc-msg');
+  el.textContent = msg;
+  el.style.color = ok ? '#00e676' : '#ff4444';
+  setTimeout(() => { el.textContent = ''; }, 4000);
+}
+
+async function procStart(mode) {
+  _setProcBusy(mode, true);
+  _showProcMsg('启动中...', true);
+  try {
+    const r = await fetch('/api/processes/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode})
+    });
+    const data = await r.json();
+    _showProcMsg(data.msg, data.ok);
+  } catch(e) {
+    _showProcMsg('请求失败: ' + e, false);
+  } finally {
+    setTimeout(() => { _setProcBusy(mode, false); loadProcesses(); }, 1500);
+  }
+}
+
+async function procStop(mode) {
+  const label = mode === 'live' ? '实盘' : '模拟盘';
+  if (!confirm(`确定要停止「${label}」进程？`)) return;
+  _setProcBusy(mode, true);
+  _showProcMsg('停止中...', true);
+  try {
+    const r = await fetch('/api/processes/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode})
+    });
+    const data = await r.json();
+    _showProcMsg(data.msg, data.ok);
+  } catch(e) {
+    _showProcMsg('请求失败: ' + e, false);
+  } finally {
+    setTimeout(() => { _setProcBusy(mode, false); loadProcesses(); }, 1500);
+  }
+}
+
+// ==================== 初始化 ====================
+refreshAll();
+startCountdown();
+</script>
+</body>
+</html>

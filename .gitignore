@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# 数据缓存（量大，不入库）
+data_cache/
+
+# 日志
+logs/
+*.log
+output.log
+debug_output.txt
+backtest_local_output.txt
+pip_install.log
+
+# 回测结果
+backtest_result.pkl
+
+# 运行时状态文件
+state_v3.json
+state_v3_rebalance.json
+state_v3_sim.json
+trades_v3.json
+trades_v3_sim.json
+
+# 报告图片（本地截图）
+*.png
+report/
+reports/
+
+# 环境
+.env
+venv/
+.venv/
