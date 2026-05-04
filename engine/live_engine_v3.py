@@ -132,6 +132,7 @@ class LiveEngineV3:
     # 引擎名称（日志用）
     ENGINE_NAME = 'LiveEngineV3'
     TRADES_LOG_FILE = 'trades_v3.json'
+    FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'  # 买卖失败复盘日志
 
     def __init__(self, mode: str = 'live', capital_limit: float = 30000.0):
         """初始化引擎
@@ -391,7 +392,6 @@ class LiveEngineV3:
                 if _heartbeat_counter >= 5:
                     try:
                         self._save_state()
-                        self._reload_params()              # 热重载策略参数
                         self._maybe_reload_rebalance_pool()  # 热重载调仓池
                         self._check_condition_order_fills()  # 检测条件单是否已成交
                     except Exception as _he:
@@ -777,6 +777,9 @@ class LiveEngineV3:
                       f"价格={sell_price:.3f} 数量={quantity} order_id={order_id}")
             else:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 竞价卖出下单失败: {code}")
+                self._log_failed_order('sell', code, sell_price, quantity, 0, 'auction_failed',
+                                       {'sell_type': pos.get('sell_type', 'pending'),
+                                        'sell_price': sell_price})
 
     # ------------------------------------------------------------------
     # 检查集合竞价成交（9:25 检查）
@@ -885,6 +888,9 @@ class LiveEngineV3:
                 else:
                     self._cancel_order(order_id)
                     print(f"[{_now_str()}] [{self.ENGINE_NAME}] 重挂卖出超时未成交，已撤单: {code}")
+                    self._log_failed_order('sell', code, bid_price, quantity, 0, 'resubmit_timeout',
+                                           {'sell_type': pos.get('sell_type', 'pending'),
+                                            'bid_price': bid_price})
 
     # ------------------------------------------------------------------
     # 盘中持仓监控（9:30~15:00）
@@ -1149,13 +1155,17 @@ class LiveEngineV3:
 
             if not order_id or order_id == -1:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 买入下单失败，尝试下一只")
+                self._log_failed_order('buy', code, ask_price, volume_to_buy, 0, 'order_failed',
+                                       {'last_price': last_price, 'change_pct': round(change_pct, 4),
+                                        'ask_price': ask_price})
                 continue
 
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入委托: {code} "
                   f"价格={ask_price:.3f} 数量={volume_to_buy} order_id={order_id}")
 
             # 等待并获取实际成交明细（支持部分成交）
-            buy_result = self._wait_fill_result(order_id, timeout=300)
+            # monitor_while_waiting=True：等待期间每10s同步执行一次止损/止盈检查
+            buy_result = self._wait_fill_result(order_id, timeout=300, monitor_while_waiting=True)
             actual_qty = buy_result['filled_qty']
 
             if actual_qty > 0:
@@ -1178,6 +1188,8 @@ class LiveEngineV3:
                 # 部分成交时记录计划数量，供仓表盘标记显示
                 if actual_qty < volume_to_buy:
                     pos['intended_qty'] = volume_to_buy
+                    self._log_failed_order('buy', code, ask_price, volume_to_buy, actual_qty, 'partial',
+                                           {'last_price': last_price, 'change_pct': round(change_pct, 4)})
                 self.positions.append(pos)
 
                 if buy_result['status'] == 'filled':
@@ -1212,6 +1224,8 @@ class LiveEngineV3:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 买入超时未成交，已撤单，当日不再重试")
                 self._failed_buys_today[code] = today_str
                 failed_today.add(code)
+                self._log_failed_order('buy', code, ask_price, volume_to_buy, 0, 'timeout',
+                                       {'last_price': last_price, 'change_pct': round(change_pct, 4)})
                 continue
 
     # ------------------------------------------------------------------
@@ -1406,13 +1420,17 @@ class LiveEngineV3:
             # 继续等待
         return False
 
-    def _wait_fill_result(self, order_id: int, timeout: int = 180) -> dict:
+    def _wait_fill_result(self, order_id: int, timeout: int = 180,
+                           monitor_while_waiting: bool = False) -> dict:
         """等待委托成交，返回实际成交明细（支持部分成交）
 
         返回 dict:
             status:     'filled' | 'partial' | 'cancelled' | 'timeout'
             filled_qty: 已成交股数
             fill_price: 委托价格（目前 QMT API 没有均价字段，用委托价待修）
+
+        monitor_while_waiting: True 时每轮轮询后额外执行一次 _monitor_positions()，
+            用于买入等待期间持续监控持仓的止损/止盈，避免被买入循环阻塞而错过卖出时机。
         """
         start = time.time()
         check_interval = 10
@@ -1432,6 +1450,12 @@ class LiveEngineV3:
                     if status in (ORDER_STATUS_CANCELLED, ORDER_STATUS_REJECTED):
                         return {'status': 'cancelled', 'filled_qty': traded, 'fill_price': price}
                     # ORDER_STATUS_PARTIAL (53) → 继续等待
+            # 买入等待期间：持续监控持仓止损/止盈，避免被买入循环阻塞
+            if monitor_while_waiting:
+                try:
+                    self._monitor_positions()
+                except Exception as _me:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入等待中止损监控异常: {_me}")
 
         # 超时：主动撤单后取最终成交量
         self._cancel_order(order_id)
@@ -1549,6 +1573,8 @@ class LiveEngineV3:
         # ── 第3轮：加入 pending_sells，次日竞价执行 ──────────────────
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] [WARN] {code} 两轮均未全部成交，"
               f"剩余 {remaining} 股加入 pending_sells，次日竞价执行")
+        self._log_failed_order('sell', code, sell_price, quantity, quantity - remaining, 'pending',
+                               {'sell_type': sell_type, 'remaining': remaining})
         # 更新持仓剩余量
         code_bare = _strip_suffix(code)
         for p in self.positions:
@@ -1882,6 +1908,55 @@ class LiveEngineV3:
                 json.dump(trades, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 交易日志记录失败: {e}")
+
+    def _log_failed_order(self, order_type: str, code: str, intended_price: float,
+                          intended_qty: int, filled_qty: int, failure_reason: str,
+                          context: dict = None):
+        """记录买卖未成交事件到 failed_orders_v3.json，供每日复盘
+
+        参数：
+            order_type:     'buy' 或 'sell'
+            code:           股票代码（纯数字）
+            intended_price: 委托价格
+            intended_qty:   计划委托数量
+            filled_qty:     实际成交数量（0=完全未成交）
+            failure_reason: 失败原因
+                - 'order_failed'    下单接口返回 -1
+                - 'timeout'         超时撤单，完全未成交
+                - 'partial'         部分成交（买入未全量）
+                - 'pending'         两轮卖出均失败，转入次日竞价
+                - 'resubmit_timeout' 9:30 重挂卖出超时
+                - 'auction_failed'  集合竞价卖出下单失败
+            context:        额外市场信息（用于复盘分析）
+        """
+        try:
+            record = {
+                "timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "date":          date.today().strftime('%Y-%m-%d'),
+                "type":          order_type,
+                "code":          _strip_suffix(code),
+                "intended_price": round(intended_price, 3),
+                "intended_qty":  intended_qty,
+                "filled_qty":    filled_qty,
+                "failure_reason": failure_reason,
+            }
+            if context:
+                record["context"] = context
+            log_path = os.path.join(os.path.dirname(__file__), '..', self.FAILED_ORDERS_LOG_FILE)
+            records = []
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, 'r', encoding='utf-8') as f:
+                        records = json.load(f)
+                except Exception:
+                    records = []
+            records.append(record)
+            with open(log_path, 'w', encoding='utf-8') as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [复盘记录] {order_type} {_strip_suffix(code)} "
+                  f"失败({failure_reason}) 计划={intended_qty} 成交={filled_qty}")
+        except Exception as e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 失败订单记录写入异常: {e}")
 
     # ------------------------------------------------------------------
     # 状态文件 I/O

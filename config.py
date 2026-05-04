@@ -32,7 +32,6 @@ DATA_CACHE_DIR = 'd:/miniqmt_quant/data_cache'
 # ===== 回测配置 =====
 BACKTEST_INITIAL_CAPITAL = 500000   # 初始资金
 BACKTEST_COMMISSION_RATE = 0.0003   # 佣金费率
-BACKTEST_SLIPPAGE = 0.001           # 滑点
 BACKTEST_STAMP_TAX_RATE = 0.001     # 印花税率
 
 # ===== 报告配置 =====
@@ -56,7 +55,6 @@ V3_TIME_STOP_DAYS = 5           # 时间止损天数
 V3_COMMISSION_RATE = 0.00025    # 佣金0.025%
 V3_MIN_COMMISSION = 5           # 最低佣金5元
 V3_STAMP_TAX_RATE = 0.0005      # 印花税0.05%
-V3_SLIPPAGE = 0                 # 滑点0%
 V3_INITIAL_CAPITAL = 300000     # 初始资金
 V3_DATA_SOURCE = 'local'        # V3数据源: 'akshare' / 'baostock' / 'local'
 V3_LOCAL_DATA_DIR = 'D:/daily_data'  # 本地数据目录

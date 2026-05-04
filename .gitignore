@@ -27,6 +27,7 @@ trades_v3_sim.json
 trades_v3_offline.json
 state_v3_offline.json
 state_v3_rebalance_backup_*.json
+failed_orders_v3.json
 
 # 报告图片（本地截图）
 *.png
