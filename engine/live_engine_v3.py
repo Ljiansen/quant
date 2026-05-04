@@ -27,6 +27,15 @@ from datetime import datetime, date, timedelta
 sys.path.insert(0, 'd:/miniqmt_quant')
 import config
 
+# 可选：钉钉推送通知
+try:
+    from utils.notifier import notify_buy as _notify_buy
+    from utils.notifier import notify_sell as _notify_sell
+    from utils.notifier import notify_pending_sell as _notify_pending_sell
+    _NOTIFIER_OK = True
+except Exception:
+    _NOTIFIER_OK = False
+
 
 # ---------------------------------------------------------------------------
 # 全局工具函数
@@ -154,6 +163,14 @@ class LiveEngineV3:
         self.commission_rate = config.V3_COMMISSION_RATE
         self.min_commission = config.V3_MIN_COMMISSION
         self.stamp_tax_rate = config.V3_STAMP_TAX_RATE
+        # 买入信号阈值（_check_buy_signal 使用，支持热重载）
+        self.min_change_pct = config.V3_MIN_CHANGE_PCT
+        self.star_min_change_pct = config.V3_STAR_MIN_CHANGE_PCT
+        self.max_change_pct = config.V3_MAX_CHANGE_PCT
+        self.star_max_change_pct = config.V3_STAR_MAX_CHANGE_PCT
+        self.limit_up = 0.098
+        self.star_limit_up = config.V3_STAR_LIMIT_UP
+        self.prev_bar_up = getattr(config, 'V3_PREV_BAR_UP', False)  # 前5分钟K线非阴线过滤
 
         # 运行时状态
         self.positions = []         # 当前持仓列表，每个元素为 dict
@@ -184,8 +201,18 @@ class LiveEngineV3:
         # 今日买入失败记录：{code: date_str}，当日不重复挂单
         self._failed_buys_today = {}
 
-        # 买入扫描间隔控制：每10分钟扫描一次，避免频繁重复挂单
+        # 买入扫描间隔控制：每1分钟扫描一次，快速捕捉信号
         self._last_buy_scan_time = None
+
+        # 调仓池文件修改时间（用于热重载检测）
+        self._rebalance_pool_mtime = 0.0
+
+        # 条件单记录：{code: condition_order_id}
+        # 保存每只持仓股票在制券商服务器端挂起的止损条件单ID
+        # 进程崩溃后条件单仍在制券商服务器有效（当日有效期）
+        self._condition_orders = {}
+        # 启动时从 params_v3.json 热重载（若文件存在则覆盖 config.py 默认值）
+        self._reload_params()
 
         # 初始化执行器（实盘模式）
         if mode == 'live':
@@ -203,6 +230,54 @@ class LiveEngineV3:
         except Exception as e:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 执行器初始化失败: {e}")
             raise
+
+    def _maybe_reload_rebalance_pool(self):
+        """检查调仓池文件是否有更新，若有则热重载"""
+        if not os.path.exists(self.REBALANCE_FILE):
+            return
+        try:
+            current_mtime = os.path.getmtime(self.REBALANCE_FILE)
+            if current_mtime > self._rebalance_pool_mtime + 0.5:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 检测到调仓池文件已更新，执行热重载...")
+                self._load_rebalance_pool()
+        except Exception:
+            pass
+
+    def _reload_params(self):
+        """从 params_v3.json 热重载策略参数（文件不存在则静默跳过）"""
+        import json
+        params_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'params_v3.json')
+        try:
+            with open(params_file, 'r', encoding='utf-8') as _f:
+                _p = json.load(_f)
+            _m = _p.get('main_board', {})
+            _s = _p.get('star_board', {})
+            _g = _p.get('general', {})
+            # 通用
+            if 'max_positions'    in _g: self.max_positions         = int(_g['max_positions'])
+            if 'prev_bar_up'      in _g: self.prev_bar_up           = bool(int(_g['prev_bar_up']))
+            # 主板
+            if 'min_change_pct'    in _m: self.min_change_pct       = float(_m['min_change_pct'])
+            if 'hard_stop_loss'    in _m: self.hard_stop_loss        = float(_m['hard_stop_loss'])
+            if 'soft_stop_loss'    in _m: self.soft_stop_loss        = float(_m['soft_stop_loss'])
+            if 'trailing_activate' in _m: self.trailing_activate     = float(_m['trailing_activate'])
+            if 'trailing_stop'     in _m: self.trailing_stop         = float(_m['trailing_stop'])
+            if 'time_stop_days'    in _m: self.time_stop_days        = int(_m['time_stop_days'])
+            if 'limit_up'          in _m: self.limit_up              = float(_m['limit_up'])
+            if 'max_change_pct'    in _m: self.max_change_pct        = float(_m['max_change_pct'])
+            # 科创/创业板
+            if 'min_change_pct'    in _s: self.star_min_change_pct   = float(_s['min_change_pct'])
+            if 'hard_stop_loss'    in _s: self.star_hard_stop_loss   = float(_s['hard_stop_loss'])
+            if 'soft_stop_loss'    in _s: self.star_soft_stop_loss   = float(_s['soft_stop_loss'])
+            if 'trailing_activate' in _s: self.star_trailing_activate = float(_s['trailing_activate'])
+            if 'trailing_stop'     in _s: self.star_trailing_stop    = float(_s['trailing_stop'])
+            if 'time_stop_days'    in _s: self.star_time_stop_days   = int(_s['time_stop_days'])
+            if 'limit_up'          in _s: self.star_limit_up         = float(_s['limit_up'])
+            if 'max_change_pct'    in _s: self.star_max_change_pct   = float(_s['max_change_pct'])
+        except FileNotFoundError:
+            pass  # 文件不存在时使用 config.py 默认值
+        except Exception as _e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 参数热重载失败: {_e}")
 
     def _connect_executor(self):
         """连接执行器"""
@@ -265,6 +340,11 @@ class LiveEngineV3:
                             pos['days_held'] = pos.get('days_held', 0) + 1
                     self._last_increment_date = today_str
                     self._save_state()
+                    # 条件单当日有效期，每天开盘后重建
+                    try:
+                        self._setup_all_condition_orders()
+                    except Exception as _coe:
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单批量重建异常: {_coe}")
 
                 try:
                     # 9:15~9:25 集合竞价阶段：挂 pending 卖出
@@ -285,9 +365,9 @@ class LiveEngineV3:
                         self._monitor_positions()
 
                         # 持仓不足3只，扫描买入
-                        # 持仓不足，扫描买入（每10分钟扫描一次）
+                        # 持仓不足，扫描买入（每分钟扫描一次，快速捕捉信号）
                         if self._count_effective_positions() < self.max_positions:
-                            _scan_interval_secs = 10 * 60
+                            _scan_interval_secs = 1 * 60
                             _should_scan = (
                                 self._last_buy_scan_time is None or
                                 (datetime.now() - self._last_buy_scan_time).total_seconds() >= _scan_interval_secs
@@ -309,7 +389,13 @@ class LiveEngineV3:
                 # 心跳：每5分钟刷新一次 last_update，保证仪表盘时间显示准确
                 _heartbeat_counter += 1
                 if _heartbeat_counter >= 5:
-                    self._save_state()
+                    try:
+                        self._save_state()
+                        self._reload_params()              # 热重载策略参数
+                        self._maybe_reload_rebalance_pool()  # 热重载调仓池
+                        self._check_condition_order_fills()  # 检测条件单是否已成交
+                    except Exception as _he:
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 心跳处理异常: {_he}")
                     _heartbeat_counter = 0
 
                 # 每分钟轮询一次
@@ -369,16 +455,29 @@ class LiveEngineV3:
         if self.mode == 'live' and self.executor is not None:
             self._reconcile_with_broker()
 
+        # 实盘模式：批量重建条件单（上一日条件单已失效，重挂当日止损单）
+        self._setup_all_condition_orders()
+
     def _reconcile_with_broker(self):
         """与券商真实持仓核对（实盘模式专用）
 
         逻辑：
         - 查询 miniQMT 真实持仓
         - 对比本策略记录的持仓
-        - 打印差异（不自动修正，需人工干预）
+        - extra_in_broker：券商有策略未记录的股票（手动买入）→ 打印警告，不干预
+        - missing_in_broker：策略记录但券商已无持仓的股票
+          判断为条件单已成交，自动从策略持仓移除
         """
         try:
             real_positions = self.executor.query_positions()
+
+            # 安全防护：如果制券商返回空持仓但策略有持仓，极可能是 API 异常（query_positions 在连接失败时会静默返回 []）
+            # 防止误判全部持仓已卖出而清倉。
+            if not real_positions and self.positions:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] 制券商返回空持仓但策略记录有{len(self.positions)}只，"
+                      f"疑似 API 异常，跳过持仓核对（请确认 QMT 客户端连接正常）")
+                return
+
             real_codes = {_strip_suffix(p['symbol']) for p in real_positions if p.get('volume', 0) > 0}
             strategy_codes = {_strip_suffix(p.get('code', p.get('symbol', ''))) for p in self.positions}
 
@@ -386,14 +485,215 @@ class LiveEngineV3:
             missing_in_broker = strategy_codes - real_codes
 
             if extra_in_broker:
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] 券商持仓中有策略未记录的股票: {extra_in_broker}")
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] 券商持仓中有策略未记录的股票（可能为手动买入）: {extra_in_broker}")
             if missing_in_broker:
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] 策略持仓中有券商未持有的股票: {missing_in_broker}")
+                # 制券商已无该股票持仓，判断为条件单已成交或手动卖出
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 策略记录中券商已无持仓的股票（判断为条件单已成交或已卖出）: {missing_in_broker}")
+                for code in missing_in_broker:
+                    pos = next((p for p in self.positions
+                                if _strip_suffix(p.get('code', p.get('symbol', ''))) == code), None)
+                    if pos:
+                        buy_price = pos.get('buy_price', 0)
+                        quantity = pos.get('quantity', 0)
+                        is_star = self._is_star(code)
+                        hard_sl = self.star_hard_stop_loss if is_star else self.hard_stop_loss
+                        est_price = round(buy_price * (1 - hard_sl), 3)
+                        self._log_trade('sell', code, est_price, quantity, 'condition_order_fill')
+                        self._remove_position(code)      # 使用辅助方法移除持仓
+                        self._remove_pending_sell(code)  # 同步清理 pending_sells
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 自动清理: {code} 已从策略持仓移除（券商无该股票）")
+                    # 同时清理条件单内存
+                    if code in self._condition_orders:
+                        del self._condition_orders[code]
+                if missing_in_broker:
+                    self.cash = self._get_available_cash()  # 同步现金（反映条件单卖出收入）
+                    self._save_state()
             if not extra_in_broker and not missing_in_broker:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 持仓核对一致，共 {len(real_codes)} 只")
 
         except Exception as e:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 持仓核对异常: {e}")
+
+    # ------------------------------------------------------------------
+    # 条件单管理（服务器端止损兜底）
+    # ------------------------------------------------------------------
+    def _setup_condition_order(self, pos: dict, override_stop_price: float = None) -> bool:
+        """为持仓股票挂防崩盘止损条件单
+
+        触发价设为硬止损价（或 override_stop_price），委托价为触发价再降 0.5％（留让躺间）。
+        T+0（买入当天）不挂单，防止 T+1 违规。
+
+        Returns:
+            是否成功挂单
+        """
+        if not self.executor or self.mode != 'live':
+            return False
+
+        code = _strip_suffix(pos.get('code', pos.get('symbol', '')))
+        symbol = _format_symbol(code)
+
+        # T+1：买入当天不挂条件单
+        days_held = _calculate_days_held(pos)
+        if days_held == 0:
+            return False
+
+        buy_price = pos.get('buy_price', 0)
+        if buy_price <= 0:
+            return False
+
+        is_star = self._is_star(code)
+        hard_sl = self.star_hard_stop_loss if is_star else self.hard_stop_loss
+        trigger_price = override_stop_price if override_stop_price is not None else round(buy_price * (1 - hard_sl), 3)
+        if trigger_price <= 0:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单触发价异常 {code}: trigger_price={trigger_price}，跳过")
+            return False
+        # 委托价略低于触发价，尽量成交（避免价跌过快导致限价不成交）
+        sell_price = round(trigger_price * 0.995, 3)
+        quantity = pos.get('quantity', 0)
+        if quantity <= 0:
+            return False
+
+        # 如果已有条件单，先撤销旧的
+        self._cancel_condition_order_for_code(code)
+
+        try:
+            cond_id = self.executor.place_condition_order(
+                symbol=symbol,
+                trigger_price=trigger_price,
+                sell_price=sell_price,
+                volume=quantity,
+                order_remark=f"V3_cond_sl_{code}",
+            )
+            if cond_id != -1:
+                self._condition_orders[code] = cond_id
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单已挂: {code} "
+                      f"触发={trigger_price:.3f} 委托={sell_price:.3f} 数量={quantity} cond_id={cond_id}")
+                return True
+            else:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单挂单失败: {code}")
+                return False
+        except Exception as e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单挂单异常 {code}: {e}")
+            return False
+
+    def _cancel_condition_order_for_code(self, code: str) -> bool:
+        """撤销指定股票的条件单（如果存在）
+
+        在程序主动发起卖出前必须先撤销条件单，防止双重卖出。
+        """
+        cond_id = self._condition_orders.get(code)
+        if cond_id is None:
+            return True  # 未挂单，无需撤销
+        try:
+            ok = self.executor.cancel_condition_order(cond_id)
+        except Exception as e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 撤销条件单异常 {code}: {e}")
+            ok = False
+        # 不管成功与否，都从内存移除（避免重复撤销）
+        del self._condition_orders[code]
+        if ok:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单已撤销: {code} cond_id={cond_id}")
+        return ok
+
+    def _update_condition_order(self, pos: dict, new_stop_price: float) -> bool:
+        """更新条件单触发价（移动止盈触发线上升时调用）
+
+        撤销旧条件单，按新触发价重挂。
+        """
+        return self._setup_condition_order(pos, override_stop_price=new_stop_price)
+
+    def _setup_all_condition_orders(self):
+        """批量为所有持仓股票重建条件单（启动恢复 / 每日开盘前调用）
+
+        最常见场景：
+        1. 引擎启动恢复时：上一日的条件单已失效，重挂当日条件单
+        2. 每天开盘前：条件单当日有效期，重新挂单
+        """
+        if self.mode != 'live' or not self.executor:
+            return
+
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 批量重建条件单，共 {len(self.positions)} 只持仓...")
+        ok_count = 0
+        # 已在 pending_sells 中的股票即将竞价卖出，无需挂条件单
+        pending_codes = {_strip_suffix(p.get('code', p.get('symbol', ''))) for p in self.pending_sells}
+        for pos in self.positions:
+            code = _strip_suffix(pos.get('code', pos.get('symbol', '')))
+            if code in pending_codes:
+                continue  # 已在待卖队列，跳过挂单
+            # 计算有效止损价：如果移动止盈已激活，优先使用回撤触发线（更紧的保护）
+            override_price = None
+            buy_price   = pos.get('buy_price', 0)
+            highest_p   = pos.get('highest_price', buy_price)
+            if buy_price > 0:
+                _is_s     = self._is_star(code)
+                _t_act    = self.star_trailing_activate if _is_s else self.trailing_activate
+                _t_pct    = self.star_trailing_stop     if _is_s else self.trailing_stop
+                if highest_p >= buy_price * (1 + _t_act):
+                    # 移动止盈已激活：用回撤触发线作为条件单触发价（比硬止损更高，防崩保护更严）
+                    override_price = round(highest_p * (1 - _t_pct), 3)
+            if self._setup_condition_order(pos, override_stop_price=override_price):
+                ok_count += 1
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单重建完成: 成功 {ok_count}/{len(self.positions)} 只")
+
+    def _check_condition_order_fills(self):
+        """检测条件单是否已触发成交（每5分钟心跳调用）
+
+        通过对比制券商真实持仓和策略记录，检测条件单是否已触发：
+        - 策略记录中有某套股票，但制券商真实持仓已没有该股票：则判定条件单已成交
+        - 清理策略内存中的该持仓记录，并记录交易日志
+        """
+        if self.mode != 'live' or not self.executor or not self._condition_orders:
+            return
+
+        try:
+            real_positions = self.executor.query_positions()
+            real_codes = {_strip_suffix(p['symbol']) for p in real_positions if p.get('volume', 0) > 0}
+        except Exception as e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单检测查询持仓失败: {e}")
+            return
+
+        # 安全防护：若制券商返回空持仓但策略有持仓，极可能是 API 错误（executor.query_positions 遇到连接异常时会静默返回 []）
+        # 这种情况下或误清仓，故保守跳过。错过的条件单成交在重启时由 _reconcile_with_broker 补齐。
+        if not real_positions and self.positions:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单检测：制券商返回空持仓但策略记录有{len(self.positions)}只，"
+                  f"保守跳过（重启时 _reconcile_with_broker 会自动补齐）")
+            return
+
+        filled_codes = []
+        for code in list(self._condition_orders.keys()):
+            if code not in real_codes:
+                # 制券商已无该股票持仓，判定条件单已成交
+                filled_codes.append(code)
+
+        for code in filled_codes:
+            try:
+                # 找到对应持仓记录
+                pos = next((p for p in self.positions
+                            if _strip_suffix(p.get('code', p.get('symbol', ''))) == code), None)
+                if pos:
+                    buy_price = pos.get('buy_price', 0)
+                    quantity = pos.get('quantity', 0)
+                    # 止损价估算（硬止损线）
+                    is_star = self._is_star(code)
+                    hard_sl = self.star_hard_stop_loss if is_star else self.hard_stop_loss
+                    est_price = round(buy_price * (1 - hard_sl), 3)
+                    self._log_trade('sell', code, est_price, quantity, 'condition_order_fill')
+                    self._remove_position(code)        # 使用辅助方法移除持仓
+                    self._remove_pending_sell(code)    # 同步清理 pending_sells，防止次日竞价重复卖出
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单成交检测: {code} 已从制券商移除，"
+                          f"估算成交价约={est_price:.3f}，已从策略持仓移除")
+                else:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单成交检测: {code} 制券商已无持仓（策略记录已不存在）")
+                # 从条件单内存移除
+                del self._condition_orders[code]
+            except Exception as _ce:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 条件单成交清理异常 {code}: {_ce}")
+                # 岆管清理失败也移除内存记录，避免下次心跳重复处理
+                self._condition_orders.pop(code, None)
+
+        if filled_codes:
+            self.cash = self._get_available_cash()  # 对齐资金
+            self._save_state()
 
     # ------------------------------------------------------------------
     # 加载调仓池
@@ -406,6 +706,7 @@ class LiveEngineV3:
                     data = json.load(f)
                 self.rebalance_pool = data.get('pool', [])
                 rebalance_date = data.get('rebalance_date', '未知')
+                self._rebalance_pool_mtime = os.path.getmtime(self.REBALANCE_FILE)
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 调仓池加载成功: {len(self.rebalance_pool)} 只，"
                       f"调仓日={rebalance_date}")
             except Exception as e:
@@ -458,6 +759,9 @@ class LiveEngineV3:
 
             # 竞价限价：昨收 × 0.99
             sell_price = round(pre_close * 0.99, 2)
+
+            # 竞价卖出前先撤销条件单，防止条件单与竞价单同时触发导致双重卖出
+            self._cancel_condition_order_for_code(code)
 
             order_id = self._place_sell_order(
                 code=code,
@@ -633,6 +937,10 @@ class LiveEngineV3:
             if last_price > highest_price:
                 highest_price = last_price
                 pos['highest_price'] = highest_price
+                # 最高价上升时，若移动止盈已激活，更新条件单触发价至新的回撤线
+                if highest_price >= buy_price * (1 + trail_act):
+                    new_trail_trigger = round(highest_price * (1 - trail_pct), 3)
+                    self._update_condition_order(pos, new_stop_price=new_trail_trigger)
 
             # T+1限制：买入当天（days_held==0）不执行卖出
             days_held = _calculate_days_held(pos)
@@ -665,6 +973,9 @@ class LiveEngineV3:
                 quantity = pos.get('quantity', 0)
                 if quantity <= 0:
                     continue
+
+                # 下单前先撤销条件单，防止主动卖出与条件单同时触发导致双重卖出
+                self._cancel_condition_order_for_code(code)
 
                 self._execute_sell_with_fallback(
                     code=code, sell_price=sell_price, quantity=quantity,
@@ -703,8 +1014,17 @@ class LiveEngineV3:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 可用资金{available_cash:.0f}不足单槕最低资金{min_viable:.0f}元，跳过")
             return
 
-        # 排除已持仓的股票
+        # 排除已持仓的股票（策略记录 + 制券商真实持仓）
         held_codes = {_strip_suffix(p.get('code', p.get('symbol', ''))) for p in self.positions}
+        # 引入制券商真实持仓，防止对手动买入的股票重复下单
+        if self.mode == 'live' and self.executor:
+            try:
+                _real_pos = self.executor.query_positions()
+                for _rp in _real_pos:
+                    if _rp.get('volume', 0) > 0:
+                        held_codes.add(_strip_suffix(_rp['symbol']))
+            except Exception:
+                pass  # 查询失败时退化为仅使用策略记录
 
         # 当日可交易池（二次过滤）
         tradable_pool = self._get_tradable_pool(held_codes)
@@ -771,6 +1091,29 @@ class LiveEngineV3:
             }
             change_pct = (last_price - pre_close) / pre_close if pre_close > 0 else 0
             is_positive = last_price > open_price if open_price > 0 else False
+
+            # 前5分钟K线非阴线过滤（close >= open）
+            if self.prev_bar_up:
+                try:
+                    from xtquant import xtdata as _xtd
+                    _hist = _xtd.get_market_data(
+                        field_list=['open', 'close', 'volume'],
+                        stock_list=[symbol],
+                        period='5m',
+                        count=2
+                    )
+                    _pb_opens  = _hist.get('open',  {}).get(symbol, [])
+                    _pb_closes = _hist.get('close', {}).get(symbol, [])
+                    if len(_pb_opens) >= 2 and len(_pb_closes) >= 2:
+                        _pb_o = float(_pb_opens[-2])
+                        _pb_c = float(_pb_closes[-2])
+                        if _pb_c < _pb_o:
+                            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
+                                  f"前K线阴线({_pb_c:.2f}<{_pb_o:.2f})，跳过")
+                            continue
+                except Exception:
+                    pass  # 获取失败时不过滤
+
             if not self._check_buy_signal(code, bar, pre_close):
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} 不满足买入条件: "
                       f"涨幅={change_pct:.2%}, 收阳={is_positive}, last={last_price:.2f}")
@@ -850,6 +1193,20 @@ class LiveEngineV3:
                 self._log_trade('buy', code, ask_price, actual_qty, 'buy_signal', fee=commission)
                 self._save_state()
 
+                # 买入当天不挂条件单（T+1）；次日启动恢复时统一批量重建
+                # 若已持仓超过一天（源于恶意调用），立即挂单
+                if _calculate_days_held(pos) > 0:
+                    self._setup_condition_order(pos)
+
+                # 钉钉通知：买入成交
+                if _NOTIFIER_OK:
+                    try:
+                        _chg = (ask_price - pre_close) / pre_close * 100 if pre_close > 0 else 0
+                        _notify_buy(code=code, price=ask_price, volume=actual_qty,
+                                    amount=total_paid, change_pct=_chg)
+                    except Exception:
+                        pass
+
             else:
                 # 完全未成交，_wait_fill_result 超时时已自动撤单
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 买入超时未成交，已撤单，当日不再重试")
@@ -903,7 +1260,6 @@ class LiveEngineV3:
 
             is_star = self._is_star(code)
             soft_sl = self.star_soft_stop_loss if is_star else self.soft_stop_loss
-            tp = self.star_take_profit if is_star else self.take_profit  # 已废弃
             time_stop = self.star_time_stop_days if is_star else self.time_stop_days
             trail_act = self.star_trailing_activate if is_star else self.trailing_activate
             trail_pct = self.star_trailing_stop    if is_star else self.trailing_stop
@@ -937,8 +1293,17 @@ class LiveEngineV3:
                     pending = dict(pos)
                     pending['sell_type'] = sell_type
                     self.pending_sells.append(pending)
+                    # 14:55 入队同时撤销条件单，防止 14:55-15:00 间条件单与次日竞价单双重触发
+                    self._cancel_condition_order_for_code(code)
                     print(f"[{_now_str()}] [{self.ENGINE_NAME}] 加入 pending_sells: {code} "
                           f"类型={sell_type} 持仓天数={days_held} 现价={last_price:.3f}")
+                    # 钉钉通知：待卖出信号
+                    if _NOTIFIER_OK:
+                        try:
+                            _notify_pending_sell(code=code, sell_type=sell_type,
+                                                 days_held=days_held, last_price=last_price)
+                        except Exception:
+                            pass
 
         # 保存状态
         self._save_state()
@@ -1089,6 +1454,15 @@ class LiveEngineV3:
         commission  = max(fill_price * filled_qty * self.commission_rate, self.min_commission)
         stamp_tax   = fill_price * filled_qty * self.stamp_tax_rate
 
+        # 钉钉通知：卖出成交
+        if _NOTIFIER_OK:
+            try:
+                _notify_sell(code=_strip_suffix(code), price=fill_price, volume=filled_qty,
+                             sell_type=sell_type, buy_price=buy_price,
+                             days_held=days_held, profit_pct=profit_pct)
+            except Exception:
+                pass
+
         self.cash += net_income
         self._log_trade('sell', code, fill_price, filled_qty, sell_type,
                         fee=commission + stamp_tax, days_held=days_held)
@@ -1173,7 +1547,7 @@ class LiveEngineV3:
             return
 
         # ── 第3轮：加入 pending_sells，次日竞价执行 ──────────────────
-        print(f"[{_now_str()}] [{self.ENGINE_NAME}] ⚠️ {code} 两轮均未全部成交，"
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [WARN] {code} 两轮均未全部成交，"
               f"剩余 {remaining} 股加入 pending_sells，次日竞价执行")
         # 更新持仓剩余量
         code_bare = _strip_suffix(code)
@@ -1432,8 +1806,9 @@ class LiveEngineV3:
 
         条件（全部满足）：
         1. 涨幅 > 阈值（科创板/创业板>2%，主板>1%）
-        2. 收阳线：close > open
-        3. 未涨停（科创板/创业板<19.8%，主板<9.8%）
+        2. 涨幅 < 防追高阈值（科创/创业板<8%，主板<5%）
+        3. 收阳线：close > open
+        4. 未涨停（科创板/创业板<19.8%，主板<9.8%）
         """
         if pre_close <= 0:
             return False
@@ -1450,17 +1825,22 @@ class LiveEngineV3:
         is_star = self._is_star(code)
 
         # 1. 涨幅阈值
-        min_change = config.V3_STAR_MIN_CHANGE_PCT if is_star else config.V3_MIN_CHANGE_PCT
+        min_change = self.star_min_change_pct if is_star else self.min_change_pct
         if change_pct <= min_change:
             return False
 
-        # 2. 收阳线
+        # 2. 防追高：涨幅不超过上限
+        max_change = self.star_max_change_pct if is_star else self.max_change_pct
+        if change_pct >= max_change:
+            return False
+
+        # 3. 收阳线
         if close <= open_price:
             return False
 
-        # 3. 未涨停
-        limit_up = config.V3_STAR_LIMIT_UP if is_star else 0.098
-        if change_pct >= limit_up:
+        # 4. 未涨停
+        _limit_up = self.star_limit_up if is_star else self.limit_up
+        if change_pct >= _limit_up:
             return False
 
         return True

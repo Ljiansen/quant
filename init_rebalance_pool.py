@@ -91,28 +91,61 @@ def get_all_stock_codes(data_dir):
     return sorted(codes)
 
 
-def main():
+# 支持的选股策略
+STRATEGIES = {
+    'ba': {
+        'name': 'B+A（最优组合）',
+        'desc': 'MA20趋势过滤 + 信号质量排名（点刃两层屏蔽）',
+        'use_ma20':    True,
+        'quality_mode': True,
+    },
+    'a': {
+        'name': 'A（信号质量）',
+        'desc': '信号质量排名，不做MA20过滤（选历史胜率高的股票）',
+        'use_ma20':    False,
+        'quality_mode': True,
+    },
+    'b': {
+        'name': 'B（趋势 MA20）',
+        'desc': 'MA20趋势过滤 + 信号频率排名（不要求收阳线）',
+        'use_ma20':    True,
+        'quality_mode': False,
+    },
+}
+
+
+def main(strategy: str = 'ba'):
+    if strategy not in STRATEGIES:
+        print(f'[!] 未知策略 "{strategy}"，已回退到 ba')
+        strategy = 'ba'
+    sinfo = STRATEGIES[strategy]
     print("=" * 60)
-    print("【紧急】初始化 V3 调仓池")
+    print(f"》{sinfo['name']}「初始化 V3 调仓池")
+    print(f"选股公式: {sinfo['desc']}")
     print("=" * 60)
 
     data_dir = config.V3_LOCAL_DATA_DIR
-    rebalance_date = '2026-01-05'  # 2026年1月第一个交易日
-    rebalance_date_ymd = rebalance_date.replace('-', '')
+
+    # 自动使用今天日期（如果不在交易日内则和就取最近交易日）
+    from datetime import date as _date
+    today_str = _date.today().strftime('%Y-%m-%d')
 
     # 1. 构建交易日历
     print("\n[1/4] 构建交易日历...")
     trading_dates = build_trading_calendar(data_dir)
     print(f"  交易日历: {len(trading_dates)} 个交易日 ({trading_dates[0]} ~ {trading_dates[-1]})")
 
-    if rebalance_date not in trading_dates:
-        print(f"  错误: {rebalance_date} 不在交易日历中")
-        return
+    # 取最近交易日
+    if today_str in trading_dates:
+        rebalance_date = today_str
+    else:
+        rebalance_date = max(d for d in trading_dates if d <= today_str)
+    rebalance_date_ymd = rebalance_date.replace('-', '')
 
     cur_idx = trading_dates.index(rebalance_date)
     lookback_start_idx = max(0, cur_idx - config.V3_REBALANCE_LOOKBACK)
     lookback_start_date = trading_dates[lookback_start_idx]
-    lookback_start_ymd = lookback_start_date.replace('-', '')
+    lookback_start_ymd  = lookback_start_date.replace('-', '')
 
     print(f"  调仓日: {rebalance_date} (索引 {cur_idx})")
     print(f"  回看 {config.V3_REBALANCE_LOOKBACK} 个交易日，起始: {lookback_start_date}")
@@ -129,10 +162,15 @@ def main():
     print(f"  本地股票总数: {len(all_codes)}")
     print(f"  符合板块规则: {len(filtered_codes)}")
 
-    # 3. 逐只读取数据，计算排名指标
-    print("\n[3/4] 读取数据并计算排名指标...")
+    # 3. 逐只读取数据，计算 B+A 指标
+    print("\n[3/4] 读取数据并计算 B+A 指标...")
     lookback_dates_set = set(trading_dates[lookback_start_idx:cur_idx + 1])
-    rebalance_dt = pd.to_datetime(rebalance_date)
+    ma20_dates_set     = set(trading_dates[max(0, cur_idx - 20):cur_idx + 1])
+    rebalance_dt       = pd.to_datetime(rebalance_date)
+
+    # B+A 选股参数（与实盘一致）
+    min_chg = config.V3_MIN_CHANGE_PCT    # 1%
+    max_chg = config.V3_MAX_CHANGE_PCT    # 7%
 
     results = []
     total = len(filtered_codes)
@@ -140,7 +178,6 @@ def main():
         if (i + 1) % 500 == 0 or i == 0:
             print(f"  处理中: {i+1}/{total}...")
 
-        # 读取完整历史到调仓日（用于新股判断）
         df_full = get_stock_data(code, data_dir, '20220101', rebalance_date_ymd)
         if df_full.empty:
             continue
@@ -150,59 +187,78 @@ def main():
         if total_rows < 60:
             continue
 
-        # 截取回看区间数据
+        # 截取回看区间
         period_df = df_full[df_full['date'].isin(
             pd.to_datetime(list(lookback_dates_set))
-        )].copy()
+        )].copy().sort_values('date')
 
-        if period_df.empty or len(period_df) < 2:
+        if period_df.empty or len(period_df) < 5:
             continue
 
-        # 计算总成交额
-        total_amount = float(period_df['amount'].sum())
-
-        # 计算累计涨跌幅：(最后收盘 - 最早收盘) / 最早收盘
-        period_df = period_df.sort_values('date')
-        first_close = float(period_df.iloc[0]['close'])
+        # ── B: MA20 趋势过滤（ba 和 b 策略使用）────────────────────────────────────
+        ma20_df = df_full[df_full['date'].isin(pd.to_datetime(list(ma20_dates_set)))]
         last_close = float(period_df.iloc[-1]['close'])
-        if first_close <= 0:
-            continue
-        cum_pct = (last_close - first_close) / first_close
+        if sinfo['use_ma20']:
+            if ma20_df.empty:
+                continue
+            ma20 = float(ma20_df['close'].mean())
+            if last_close <= ma20:
+                continue   # 跌破MA20，直接排除
+        else:
+            ma20 = float(ma20_df['close'].mean()) if not ma20_df.empty else 0.0
+
+        # ── 信号得分────────────────────────────────────────────────
+        period_df = period_df.copy()
+        period_df['prev_close'] = period_df['close'].shift(1)
+        period_df = period_df.dropna(subset=['prev_close'])
+        period_df = period_df[period_df['prev_close'] > 0]
+        period_df['daily_chg'] = (period_df['close'] - period_df['prev_close']) / period_df['prev_close']
+
+        if sinfo['quality_mode']:
+            # 信号质量: 涨幅在区间 AND 收阳线
+            score_mask = (
+                (period_df['daily_chg'] > min_chg) &
+                (period_df['daily_chg'] < max_chg) &
+                (period_df['close'] > period_df['open'])
+            )
+        else:
+            # 信号频率: 涨幅在区间即可（不要求收阳）
+            score_mask = (
+                (period_df['daily_chg'] > min_chg) &
+                (period_df['daily_chg'] < max_chg)
+            )
+        quality_score = int(score_mask.sum())
 
         results.append({
-            'code': code,
-            'total_amount': total_amount,
-            'cum_pct': cum_pct,
+            'code':          code,
+            'quality_score': quality_score,
+            'last_close':    last_close,
+            'ma20':          round(ma20, 4),
         })
 
-    print(f"  有效股票数: {len(results)}")
+    print(f"  MA20过滤后有效股票数: {len(results)}")
 
     if not results:
         print("  错误: 没有有效股票数据")
         return
 
-    # 4. 综合排名
-    print("\n[4/4] 综合排名并保存...")
+    # 4. 按 quality_score 降序取 Top N
+    print("\n[4/4] 排名并保存...")
     result_df = pd.DataFrame(results)
+    result_df = result_df.sort_values('quality_score', ascending=False)
 
-    # 排名：越大越好，所以 ascending=False → rank升序=排名1最好
-    result_df['amount_rank'] = result_df['total_amount'].rank(ascending=False, method='min')
-    result_df['pct_rank'] = result_df['cum_pct'].rank(ascending=False, method='min')
-
-    # 综合排名越小越好
-    result_df['composite_rank'] = (
-        result_df['amount_rank'] * 0.5 + result_df['pct_rank'] * 0.5
-    )
-
-    # 取综合排名前 top_n
     top_n = config.V3_TOP_N
-    result_df = result_df.sort_values('composite_rank').head(top_n)
+    result_df = result_df.head(top_n)
     pool = result_df['code'].tolist()
 
-    # 5. 输出文件（与 live_engine_v3.py 读取格式一致）
+    # 5. 输出文件
     output = {
-        'pool': pool,
-        'rebalance_date': rebalance_date,
+        'pool':            pool,
+        'rebalance_date':  rebalance_date,
+        'strategy_key':    strategy,
+        'strategy':        sinfo['name'],
+        'min_chg':         min_chg,
+        'max_chg':         max_chg,
     }
     output_path = 'd:/miniqmt_quant/state_v3_rebalance.json'
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -211,10 +267,16 @@ def main():
     print(f"  文件已保存: {output_path}")
     print(f"  调仓池大小: {len(pool)}")
     print("\n" + "=" * 60)
-    print(f"调仓池生成完成！共 {len(pool)} 只股票")
+    print(f"\u9009股完成！共 {len(pool)} 只股票")
+    print("  调仓日:", rebalance_date)
+    print("  策略:", sinfo['name'])
+    print("  应用参数: min_chg={:.0%}  max_chg={:.0%}  MA20趋势过滤={}".format(
+        min_chg, max_chg, '开' if sinfo['use_ma20'] else '关'))
     print("=" * 60)
     for i, code in enumerate(pool, 1):
-        print(f"  {i:2d}. {code}")
+        row = result_df[result_df['code'] == code].iloc[0]
+        print(f"  {i:2d}. {code}  信号质量={int(row['quality_score'])}天  "
+              f"收盘={row['last_close']:.2f}  MA20={row['ma20']:.2f}")
 
 
 if __name__ == '__main__':

@@ -18,12 +18,15 @@ pip_install.log
 # 回测结果
 backtest_result.pkl
 
-# 运行时状态文件
+# 运行时状态文件（机器级，不入库）
 state_v3.json
 state_v3_rebalance.json
 state_v3_sim.json
 trades_v3.json
 trades_v3_sim.json
+trades_v3_offline.json
+state_v3_offline.json
+state_v3_rebalance_backup_*.json
 
 # 报告图片（本地截图）
 *.png
@@ -34,3 +37,64 @@ reports/
 .env
 venv/
 .venv/
+
+# 覆盖率产物
+.coverage
+cov*.txt
+coverage_run*.txt
+z_*.py,cover
+
+# 临时/调试脚本（以下划线开头）
+_*.py
+_*.txt
+
+# 临时调试与分析脚本（一次性）
+analyze_pool_positive_rate.py
+analyze_results.py
+compare_max_change.py
+diag_step1.py
+diag_step1_full.py
+diag_step3.py
+download_5min_2022.py
+download_5min_2022_missing.py
+download_5min_data.py
+download_daily_2021.py
+download_daily_2021_all.py
+generate_offline_test_data.py
+import_reports_to_sim.py
+monitor_and_backtest.py
+run_backtest_2022_random.py
+run_backtest_5min.py
+run_backtest_5min_2022.py
+run_backtest_5min_live_sim.py
+run_backtest_5min_random_pool.py
+run_backtest_improved.py
+run_backtest_selection_test.py
+run_grid_search.py
+run_positive_30.py
+run_signal_analysis.py
+run_test_capture.py
+verify_pnl.py
+track_pool_performance.py
+step1_full_output.txt
+test_output.txt
+
+# 二进制与可执行文件
+cloudflared.exe
+*.exe
+
+# 生成的数据文件
+stock_names.json
+pool_performance_history.csv
+pool_positive_history*.csv
+signal_return_analysis.csv
+*.pkl
+
+# 运行期目录
+backup_*/
+grid_results/
+pool_snapshots/
+reports_2022_random_tmp/
+reports_random_tmp/
+sim_results/
+test_data/

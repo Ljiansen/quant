@@ -7,6 +7,8 @@ import os
 import json
 import sys
 import subprocess
+import threading as _threading
+from datetime import datetime as _dt_now, timedelta as _timedelta
 from flask import Flask, jsonify, request, render_template
 
 try:
@@ -35,6 +37,95 @@ PROCESS_TARGETS = {
 # 已启动的进程句柄 {mode: Popen}
 _launched_procs = {}
 
+# params_v3.json 路径（动态参数配置文件）
+_PARAMS_FILE = os.path.join(BASE_DIR, 'params_v3.json')
+
+# 模拟结果存档目录
+SIM_RESULTS_DIR = os.path.join(BASE_DIR, 'sim_results')
+
+# 参数合法范围约束
+_PARAM_RANGES = {
+    'main_board': {
+        'min_change_pct':    (0.001, 0.20),
+        'max_change_pct':    (0.01,  0.50),
+        'hard_stop_loss':    (0.01,  0.50),
+        'soft_stop_loss':    (0.005, 0.30),
+        'trailing_activate': (0.005, 0.50),
+        'trailing_stop':     (0.005, 0.30),
+        'time_stop_days':    (1,     60),
+        'limit_up':          (0.05,  0.22),
+    },
+    'star_board': {
+        'min_change_pct':    (0.001, 0.20),
+        'max_change_pct':    (0.01,  0.50),
+        'hard_stop_loss':    (0.01,  0.50),
+        'soft_stop_loss':    (0.005, 0.30),
+        'trailing_activate': (0.005, 0.50),
+        'trailing_stop':     (0.005, 0.30),
+        'time_stop_days':    (1,     60),
+        'limit_up':          (0.05,  0.22),
+    },
+    'general': {
+        'max_positions': (1, 10),
+        'prev_bar_up':   (0, 1),
+    },
+}
+
+
+def _validate_params(data):
+    """校验参数范围，返回 (cleaned_dict, error_msg_or_None)"""
+    result = {}
+    for section, fields in _PARAM_RANGES.items():
+        if section not in data:
+            return None, f'缺少字段: {section}'
+        result[section] = {}
+        src = data[section]
+        for key, (lo, hi) in fields.items():
+            if key not in src:
+                return None, f'缺少字段: {section}.{key}'
+            try:
+                val = int(src[key]) if key in ('time_stop_days', 'max_positions', 'prev_bar_up') else float(src[key])
+            except (ValueError, TypeError):
+                return None, f'参数类型错误: {section}.{key}'
+            if not (lo <= val <= hi):
+                return None, f'参数超范围: {section}.{key}={val} (应在 {lo}~{hi})'
+            result[section][key] = val
+    # 保留 general 中除校验字段外的只读字段
+    for extra_key in ('top_n', 'buy_time', 'daily_min_amount', 'daily_amount_days', 'initial_capital'):
+        if extra_key in data.get('general', {}):
+            result['general'][extra_key] = data['general'][extra_key]
+    return result, None
+
+
+# 调仓池重建运行状态
+_pool_rebuild_state = {
+    'running':      False,
+    'strategy':     'ba',
+    'msg':          '',
+    'last_rebuild': '',
+}
+
+
+def _rebuild_pool_bg(strategy: str):
+    """后台线程：调用 init_rebalance_pool.main(strategy) 重新生成调仓池"""
+    global _pool_rebuild_state
+    _pool_rebuild_state['running'] = True
+    _pool_rebuild_state['msg'] = f'正在用 {strategy} 策略重新选股（约需2分钟）...'
+    try:
+        import sys as _sys
+        _sys.path.insert(0, BASE_DIR)
+        import importlib
+        import init_rebalance_pool as _irp
+        importlib.reload(_irp)
+        _irp.main(strategy=strategy)
+        _pool_rebuild_state['strategy'] = strategy
+        _pool_rebuild_state['msg'] = '选股完成 ✓'
+        _pool_rebuild_state['last_rebuild'] = _dt_now.now().strftime('%m-%d %H:%M')
+    except Exception as _e:
+        _pool_rebuild_state['msg'] = f'失败: {_e}'
+    finally:
+        _pool_rebuild_state['running'] = False
+
 
 def _find_running_process(script_name):
     """查找正在运行指定脚本的 Python 进程，返回 (is_running, pid)"""
@@ -59,31 +150,141 @@ def _find_running_process(script_name):
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+# stock_names.json 本地名称持久缓存
+_NAMES_FILE = os.path.join(BASE_DIR, 'stock_names.json')
+_akshare_names_loaded = False  # 是否已从 akshare 批量加载过
+
+
+def _load_name_cache_from_file():
+    """启动时从 stock_names.json 加载本地名称缓存"""
+    try:
+        if os.path.exists(_NAMES_FILE):
+            with open(_NAMES_FILE, 'r', encoding='utf-8') as _f:
+                _loaded = json.load(_f)
+            _stock_name_cache.update(_loaded)
+    except Exception:
+        pass
+
+
+def _save_name_cache_to_file():
+    """将名称缓存写入 stock_names.json"""
+    try:
+        with open(_NAMES_FILE, 'w', encoding='utf-8') as _f:
+            json.dump(_stock_name_cache, _f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _try_load_akshare_names():
+    """通过 akshare 批量加载全部股票名称，加载成功后持久化到文件"""
+    global _akshare_names_loaded
+    if _akshare_names_loaded:
+        return
+    try:
+        import akshare as ak
+        df = ak.stock_info_a_code_name()
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                code = str(row.get('code', row.get('\u80a1\u7968\u4ee3\u7801', ''))).strip().zfill(6)
+                name = str(row.get('name', row.get('\u80a1\u7968\u7b80\u79f0', ''))).strip()
+                if code and name and code != 'nan':
+                    _stock_name_cache[code] = name
+            _akshare_names_loaded = True
+            _save_name_cache_to_file()
+    except Exception:
+        pass
+
+
 # 股票名称缓存
 _stock_name_cache = {}
 
+# 启动时自动加载本地名称缓存
+_load_name_cache_from_file()
+
+
+# ==================== 新股监控缓存 ====================
+_new_stock_cache = []         # [{code, name, open_date}, ...]
+_new_stock_cache_date = None  # '2026-04-30' 格式，当天有效
+_new_stock_loading = False
+
+
+def _build_new_stock_cache_bg():
+    """后台线程：扫描最近60日上市新股，通过 xtquant 获取上市日期"""
+    global _new_stock_cache, _new_stock_cache_date, _new_stock_loading
+    try:
+        today = _dt_now.now()
+        cutoff = today - _timedelta(days=61)
+        cutoff_int = int(cutoff.strftime('%Y%m%d'))
+
+        all_stocks = _xtdata.get_stock_list_in_sector('沪深A股')
+        if not all_stocks:
+            return
+
+        new_stocks = []
+        for sym in all_stocks:
+            bare = sym.split('.')[0]
+            if bare.startswith('8') or bare.startswith('4'):
+                continue
+            try:
+                detail = _xtdata.get_instrument_detail(sym)
+                if not detail:
+                    continue
+                raw_open = detail.get('OpenDate', 0) or 0
+                if not raw_open:
+                    continue
+                open_int = int(raw_open)
+                if open_int >= cutoff_int and open_int > 0:
+                    name = detail.get('InstrumentName', '') or _get_stock_name(bare)
+                    od_str = str(open_int)
+                    open_date_disp = (
+                        f"{od_str[:4]}-{od_str[4:6]}-{od_str[6:]}"
+                        if len(od_str) == 8 else od_str
+                    )
+                    new_stocks.append({
+                        'code': bare,
+                        'name': name,
+                        'open_date': open_date_disp,
+                        '_sort': open_int,
+                    })
+            except Exception:
+                continue
+
+        new_stocks.sort(key=lambda x: x['_sort'], reverse=True)
+        for s in new_stocks:
+            del s['_sort']
+
+        _new_stock_cache = new_stocks
+        _new_stock_cache_date = today.strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    finally:
+        _new_stock_loading = False
+
 
 def _get_stock_name(code):
-    """获取股票名称，优先从缓存，失败返回空字符串"""
+    """获取股票名称。优先序列：本地缓存 → xtquant → akshare"""
     bare = str(code).split('.')[0]
-    if bare in _stock_name_cache:
+    # 1. 本地缓存命中
+    if bare in _stock_name_cache and _stock_name_cache[bare]:
         return _stock_name_cache[bare]
-    if not _XTDATA_OK:
-        return ''
-    try:
-        if bare.startswith('6'):
-            symbol = bare + '.SH'
-        else:
-            symbol = bare + '.SZ'
-        detail = _xtdata.get_instrument_detail(symbol)
-        name = ''
-        if detail:
-            name = detail.get('InstrumentName', '') or ''
-        _stock_name_cache[bare] = name
-        return name
-    except Exception:
-        _stock_name_cache[bare] = ''
-        return ''
+    # 2. xtquant 在线查询
+    if _XTDATA_OK:
+        try:
+            if bare.startswith('6'):
+                symbol = bare + '.SH'
+            else:
+                symbol = bare + '.SZ'
+            detail = _xtdata.get_instrument_detail(symbol)
+            name = ''
+            if detail:
+                name = detail.get('InstrumentName', '') or ''
+            _stock_name_cache[bare] = name
+            return name
+        except Exception:
+            _stock_name_cache[bare] = ''
+    # 3. akshare 回退（批量加载一次，后续从缓存读）
+    _try_load_akshare_names()
+    return _stock_name_cache.get(bare, '')
 
 
 def create_app():
@@ -215,6 +416,38 @@ def create_app():
             pool = {}
         return jsonify(pool)
 
+    @app.route('/api/pool/status')
+    def api_pool_status():
+        """Return current pool strategy and rebuild status"""
+        pool = _read_json(os.path.join(BASE_DIR, 'state_v3_rebalance.json')) or {}
+        s_key = pool.get('strategy_key', '')
+        if not s_key:
+            # 尝试从策略名称推断
+            sname = str(pool.get('strategy', ''))
+            if 'B+A' in sname or 'ba' in sname.lower():
+                s_key = 'ba'
+            elif 'A' in sname and 'B' not in sname:
+                s_key = 'a'
+            elif 'B' in sname and 'A' not in sname:
+                s_key = 'b'
+            else:
+                s_key = 'ba'
+        return jsonify({
+            'strategy':        s_key,
+            'strategy_name':   pool.get('strategy', ''),
+            'rebalance_date':  pool.get('rebalance_date', ''),
+            'pool_size':       len(pool.get('pool', [])),
+            'rebuilding':      _pool_rebuild_state['running'],
+            'last_msg':        _pool_rebuild_state['msg'],
+            'last_rebuild':    _pool_rebuild_state['last_rebuild'],
+        })
+
+    @app.route('/api/pool/rebuild', methods=['POST'])
+    def api_pool_rebuild():
+        """Trigger async pool rebuild - DISABLED"""
+        return jsonify({'ok': False, 'msg': '选股重建功能已禁用，请通过命令行执行'}), 403
+
+
     def _get_board_info(code):
         """返回 (board_name, threshold, limit_up_pct)"""
         c = str(code).split('.')[0]
@@ -266,25 +499,25 @@ def create_app():
             if code:
                 held_codes.add(str(code).split('.')[0])
 
-        # 候选（调仓池中未持仓的股票）
-        raw_candidates = []
+        # 候选（调仓池中未持仓的股票，保留池子原始排名=score降序）
+        raw_candidates = []  # list of (rank, bare_code)
         if pool:
             pool_stocks = pool.get('pool', pool.get('stocks', []))
             if isinstance(pool_stocks, list):
-                for item in pool_stocks:
+                for rank, item in enumerate(pool_stocks):
                     if isinstance(item, dict):
                         code = item.get('code', item.get('stock_code', ''))
                     else:
                         code = str(item)
                     bare = code.split('.')[0] if code else ''
                     if bare and bare not in held_codes:
-                        raw_candidates.append(bare)
+                        raw_candidates.append((rank, bare))
 
         # 获取实时行情
-        tick_map = _get_tick_data(raw_candidates)
+        tick_map = _get_tick_data([bare for _, bare in raw_candidates])
 
         candidates = []
-        for bare in raw_candidates:
+        for rank, bare in raw_candidates:
             board_name, threshold, limit_up = _get_board_info(bare)
             item = {
                 'code': bare,
@@ -298,7 +531,8 @@ def create_app():
                 'change_pct': None,
                 'is_positive': None,
                 'meets_buy_condition': False,
-                'status': '无行情'
+                'status': '无行情',
+                'pool_rank': rank,      # 池子原始排名（0=最高分）
             }
             tick = tick_map.get(bare)
             if tick:
@@ -335,50 +569,87 @@ def create_app():
                     pass
             candidates.append(item)
 
-        # 排序：满足买入条件优先，再按涨跌幅降序
-        def sort_key(x):
-            pct = x.get('change_pct') if x.get('change_pct') is not None else -999
-            meets = 1 if x.get('meets_buy_condition') else 0
-            return (-meets, -pct)
-
-        candidates.sort(key=sort_key)
+        # 排序：按池子原始排名（= quality_score 降序），保持选股优先级
+        # meets_buy_condition 通过前端绿色行高亮区分，不破坏评分顺序
+        candidates.sort(key=lambda x: x.get('pool_rank', 9999))
 
         return jsonify({
             'candidates': candidates,
             'pending_sells': pending_sells
         })
 
-    @app.route('/api/config')
+    @app.route('/api/config', methods=['GET', 'POST'])
     def api_config():
+        if request.method == 'POST':
+            # 参数调整功能已禁用（请直接修改 config.py 并重启进程）
+            return jsonify({'ok': False, 'msg': '参数调整功能已禁用，请直接修改 config.py'}), 403
+        # GET: 优先读 params_v3.json，回退到 config.py
+        try:
+            if os.path.exists(_PARAMS_FILE):
+                with open(_PARAMS_FILE, 'r', encoding='utf-8') as _rf:
+                    data = json.load(_rf)
+                # 确保包含所有字段（就选从 config.py 补充缺失项）
+                try:
+                    import config as cfg
+                    _m = data.setdefault('main_board', {})
+                    _s = data.setdefault('star_board', {})
+                    _g = data.setdefault('general', {})
+                    _m.setdefault('min_change_pct', getattr(cfg, 'V3_MIN_CHANGE_PCT', 0.01))
+                    _m.setdefault('max_change_pct', getattr(cfg, 'V3_MAX_CHANGE_PCT', 0.05))
+                    _m.setdefault('trailing_activate', getattr(cfg, 'V3_TRAILING_ACTIVATE', 0.03))
+                    _m.setdefault('trailing_stop', getattr(cfg, 'V3_TRAILING_STOP', 0.02))
+                    _m.setdefault('hard_stop_loss', getattr(cfg, 'V3_HARD_STOP_LOSS', 0.05))
+                    _m.setdefault('soft_stop_loss', getattr(cfg, 'V3_SOFT_STOP_LOSS', 0.03))
+                    _m.setdefault('time_stop_days', getattr(cfg, 'V3_TIME_STOP_DAYS', 5))
+                    _m.setdefault('limit_up', 0.098)
+                    _s.setdefault('min_change_pct', getattr(cfg, 'V3_STAR_MIN_CHANGE_PCT', 0.02))
+                    _s.setdefault('max_change_pct', getattr(cfg, 'V3_STAR_MAX_CHANGE_PCT', 0.08))
+                    _s.setdefault('trailing_activate', getattr(cfg, 'V3_STAR_TRAILING_ACTIVATE', 0.08))
+                    _s.setdefault('trailing_stop', getattr(cfg, 'V3_STAR_TRAILING_STOP', 0.05))
+                    _s.setdefault('hard_stop_loss', getattr(cfg, 'V3_STAR_HARD_STOP_LOSS', 0.05))
+                    _s.setdefault('soft_stop_loss', getattr(cfg, 'V3_STAR_SOFT_STOP_LOSS', 0.03))
+                    _s.setdefault('time_stop_days', getattr(cfg, 'V3_STAR_TIME_STOP_DAYS', 5))
+                    _s.setdefault('limit_up', getattr(cfg, 'V3_STAR_LIMIT_UP', 0.198))
+                    _g.setdefault('top_n', getattr(cfg, 'V3_TOP_N', 50))
+                    _g.setdefault('max_positions', getattr(cfg, 'V3_MAX_POSITIONS', 3))
+                    _g.setdefault('prev_bar_up', int(getattr(cfg, 'V3_PREV_BAR_UP', False)))
+                    _g.setdefault('initial_capital', getattr(cfg, 'V3_INITIAL_CAPITAL', 300000))
+                except Exception:
+                    pass
+                return jsonify(data)
+        except Exception:
+            pass
+        # 完全回退到 config.py
         try:
             import config as cfg
             data = {
                 'main_board': {
-                    'min_change_pct': getattr(cfg, 'V3_MIN_CHANGE_PCT', 0.01),
-                    'take_profit': getattr(cfg, 'V3_TAKE_PROFIT', 0.05),
-                    'hard_stop_loss': getattr(cfg, 'V3_HARD_STOP_LOSS', 0.05),
-                    'soft_stop_loss': getattr(cfg, 'V3_SOFT_STOP_LOSS', 0.03),
-                    'time_stop_days': getattr(cfg, 'V3_TIME_STOP_DAYS', 5),
-                    'limit_up': 0.098,
+                    'min_change_pct':    getattr(cfg, 'V3_MIN_CHANGE_PCT', 0.01),
+                    'max_change_pct':    getattr(cfg, 'V3_MAX_CHANGE_PCT', 0.05),
+                    'hard_stop_loss':    getattr(cfg, 'V3_HARD_STOP_LOSS', 0.05),
+                    'soft_stop_loss':    getattr(cfg, 'V3_SOFT_STOP_LOSS', 0.03),
+                    'time_stop_days':    getattr(cfg, 'V3_TIME_STOP_DAYS', 5),
+                    'limit_up':          0.098,
                     'trailing_activate': getattr(cfg, 'V3_TRAILING_ACTIVATE', 0.03),
-                    'trailing_stop': getattr(cfg, 'V3_TRAILING_STOP', 0.02),
+                    'trailing_stop':     getattr(cfg, 'V3_TRAILING_STOP', 0.02),
                 },
                 'star_board': {
-                    'min_change_pct': getattr(cfg, 'V3_STAR_MIN_CHANGE_PCT', 0.02),
-                    'take_profit': getattr(cfg, 'V3_STAR_TAKE_PROFIT', 0.15),
-                    'hard_stop_loss': getattr(cfg, 'V3_STAR_HARD_STOP_LOSS', 0.05),
-                    'soft_stop_loss': getattr(cfg, 'V3_STAR_SOFT_STOP_LOSS', 0.03),
-                    'time_stop_days': getattr(cfg, 'V3_STAR_TIME_STOP_DAYS', 5),
-                    'limit_up': getattr(cfg, 'V3_STAR_LIMIT_UP', 0.198),
+                    'min_change_pct':    getattr(cfg, 'V3_STAR_MIN_CHANGE_PCT', 0.02),
+                    'max_change_pct':    getattr(cfg, 'V3_STAR_MAX_CHANGE_PCT', 0.08),
+                    'hard_stop_loss':    getattr(cfg, 'V3_STAR_HARD_STOP_LOSS', 0.05),
+                    'soft_stop_loss':    getattr(cfg, 'V3_STAR_SOFT_STOP_LOSS', 0.03),
+                    'time_stop_days':    getattr(cfg, 'V3_STAR_TIME_STOP_DAYS', 5),
+                    'limit_up':          getattr(cfg, 'V3_STAR_LIMIT_UP', 0.198),
                     'trailing_activate': getattr(cfg, 'V3_STAR_TRAILING_ACTIVATE', 0.08),
-                    'trailing_stop': getattr(cfg, 'V3_STAR_TRAILING_STOP', 0.05),
+                    'trailing_stop':     getattr(cfg, 'V3_STAR_TRAILING_STOP', 0.05),
                 },
                 'general': {
-                    'top_n': getattr(cfg, 'V3_TOP_N', 50),
-                    'max_positions': getattr(cfg, 'V3_MAX_POSITIONS', 3),
-                    'buy_time': getattr(cfg, 'V3_BUY_TIME', '14:30'),
+                    'top_n':           getattr(cfg, 'V3_TOP_N', 50),
+                    'max_positions':   getattr(cfg, 'V3_MAX_POSITIONS', 3),
+                    'prev_bar_up':     int(getattr(cfg, 'V3_PREV_BAR_UP', False)),
                     'initial_capital': getattr(cfg, 'V3_INITIAL_CAPITAL', 300000),
-                }
+                },
+                '_meta': {'last_modified': '', 'modified_by': ''},
             }
         except Exception as e:
             data = {'error': str(e)}
@@ -402,9 +673,8 @@ def create_app():
 
     @app.route('/api/processes/start', methods=['POST'])
     def api_process_start():
-        """Start a trading process"""
-        data = request.get_json() or {}
-        mode = data.get('mode')
+        """Start a trading process - DISABLED"""
+        return jsonify({'ok': False, 'msg': '进程启动功能已禁用，请直接在命令行启动'}), 403
         if mode not in PROCESS_TARGETS:
             return jsonify({'ok': False, 'msg': '未知模式: ' + str(mode)})
         script = PROCESS_TARGETS[mode]
@@ -433,9 +703,8 @@ def create_app():
 
     @app.route('/api/processes/stop', methods=['POST'])
     def api_process_stop():
-        """Stop a trading process"""
-        data = request.get_json() or {}
-        mode = data.get('mode')
+        """Stop a trading process - DISABLED"""
+        return jsonify({'ok': False, 'msg': '进程停止功能已禁用，请直接在命令行操作'}), 403
         if mode not in PROCESS_TARGETS:
             return jsonify({'ok': False, 'msg': '未知模式'})
         script = PROCESS_TARGETS[mode]
@@ -454,4 +723,118 @@ def create_app():
         except Exception as e:
             return jsonify({'ok': False, 'msg': str(e)})
 
+    # ==================== 模拟结果存档接口 ====================
+
+    @app.route('/api/sim/list')
+    def api_sim_list():
+        """列出所有模拟存档（仅元数据，不含 equity_curve / trades 明细）"""
+        if not os.path.exists(SIM_RESULTS_DIR):
+            return jsonify([])
+        results = []
+        for fname in sorted(os.listdir(SIM_RESULTS_DIR), reverse=True):
+            if not fname.endswith('.json'):
+                continue
+            fpath = os.path.join(SIM_RESULTS_DIR, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as _f:
+                    data = json.load(_f)
+                results.append({
+                    'run_id':          data.get('run_id', ''),
+                    'start_date':      data.get('start_date', ''),
+                    'end_date':        data.get('end_date', ''),
+                    'run_time':        data.get('run_time', ''),
+                    'initial_capital': data.get('initial_capital', 300000),
+                    'summary':         data.get('summary', {}),
+                })
+            except Exception:
+                continue
+        return jsonify(results)
+
+    @app.route('/api/sim/<run_id>')
+    def api_sim_detail(run_id):
+        """返回某次模拟的完整数据（含 equity_curve 和 trades）"""
+        data, _ = _read_sim_file(run_id)
+        if data is None:
+            return jsonify({'error': f'未找到 run_id={run_id}'}), 404
+        return jsonify(data)
+
+    @app.route('/api/sim/<run_id>', methods=['DELETE'])
+    def api_sim_delete(run_id):
+        """删除某次模拟存档"""
+        _, fpath = _read_sim_file(run_id)
+        if fpath is None:
+            return jsonify({'ok': False, 'msg': f'未找到 run_id={run_id}'})
+        try:
+            os.remove(fpath)
+            return jsonify({'ok': True})
+        except Exception as _e:
+            return jsonify({'ok': False, 'msg': str(_e)})
+
+    # ==================== 新股监控接口 ====================
+
+    @app.route('/api/new_stocks')
+    def api_new_stocks():
+        global _new_stock_loading
+        if not _XTDATA_OK:
+            return jsonify({'stocks': [], 'xt_offline': True, 'loading': False})
+
+        today_str = _dt_now.now().strftime('%Y-%m-%d')
+
+        # 当天缓存失效或未加载时，触发后台刷新
+        if _new_stock_cache_date != today_str and not _new_stock_loading:
+            _new_stock_loading = True
+            t = _threading.Thread(target=_build_new_stock_cache_bg, daemon=True)
+            t.start()
+
+        # 追加实时行情
+        codes = [s['code'] for s in _new_stock_cache]
+        tick_map = _get_tick_data(codes) if codes else {}
+
+        result = []
+        for s in _new_stock_cache:
+            item = dict(s)
+            tick = tick_map.get(s['code'])
+            if tick:
+                try:
+                    last_price = tick.get('lastPrice') or 0
+                    pre_close = (tick.get('lastClose') or tick.get('preClose') or 0)
+                    if pre_close > 0 and last_price > 0:
+                        item['change_pct'] = round((last_price - pre_close) / pre_close * 100, 2)
+                        item['last_price'] = round(last_price, 3)
+                        item['pre_close'] = round(pre_close, 3)
+                    else:
+                        item['change_pct'] = None
+                        item['last_price'] = None
+                        item['pre_close'] = None
+                except Exception:
+                    item['change_pct'] = None
+                    item['last_price'] = None
+                    item['pre_close'] = None
+            else:
+                item['change_pct'] = None
+                item['last_price'] = None
+                item['pre_close'] = None
+            result.append(item)
+
+        return jsonify({
+            'stocks': result,
+            'loading': _new_stock_loading,
+            'cache_date': _new_stock_cache_date
+        })
+
     return app
+
+
+def _read_sim_file(run_id: str):
+    """按 run_id 前缀定位并读取 sim_results 中的 JSON 文件，返回 (data, filepath)"""
+    if not os.path.exists(SIM_RESULTS_DIR):
+        return None, None
+    for fname in os.listdir(SIM_RESULTS_DIR):
+        if fname.startswith(run_id) and fname.endswith('.json'):
+            fpath = os.path.join(SIM_RESULTS_DIR, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as _f:
+                    return json.load(_f), fpath
+            except Exception:
+                return None, fpath
+    return None, None

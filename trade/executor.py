@@ -389,6 +389,93 @@ class TradeExecutor:
             print(f"[{_now_str()}] [TradeExecutor] 查询订单异常: {e}")
             return []
 
+    # ------------------------------------------------------------------
+    # 条件单（服务器端止损兜底）
+    # ------------------------------------------------------------------
+    def place_condition_order(self, symbol: str, trigger_price: float, sell_price: float,
+                              volume: int, order_remark: str = '') -> int:
+        """挂止损条件单（服务器端执行，进程崩溃后仍有效）
+
+        当最新价 <= trigger_price 时，以 sell_price 限价卖出 volume 股。
+        条件单运行在券商服务器，miniQMT 进程崩溃后依然有效（当日有效期）。
+
+        Args:
+            symbol: 股票代码，如 '600000.SH'
+            trigger_price: 触发价格（最新价跌至此价时触发）
+            sell_price: 委托卖出限价
+            volume: 委托数量（股）
+            order_remark: 备注
+
+        Returns:
+            condition_order_id（整数），API 不支持或失败返回 -1
+        """
+        if not self._check_ready():
+            return -1
+
+        try:
+            # order_stock_condition 参数：account, stock_code, order_type, order_volume,
+            #   price_type, price, strategy_name, order_remark,
+            #   condition_type（1=价格条件）, condition_param
+            # condition_type=1 时 condition_param 格式：[触发价, 方向(0=<=, 1=>=)]
+            cond_id = self._trader.order_stock_condition(
+                account=self._account,
+                stock_code=symbol,
+                order_type=_ORDER_TYPE_MAP["sell"],
+                order_volume=int(volume),
+                price_type=_PRICE_TYPE_MAP["limit"],
+                price=float(sell_price),
+                strategy_name="TradeExecutor_Condition",
+                order_remark=order_remark,
+                condition_type=1,
+                condition_param=[float(trigger_price), 0],  # 0 = 价格 <= 触发价
+            )
+            if cond_id is None or cond_id == -1 or cond_id == 0:
+                print(f"[{_now_str()}] [TradeExecutor] 条件单下单失败: {symbol} "
+                      f"触发价={trigger_price} 委托价={sell_price} 返回={cond_id}")
+                return -1
+            print(f"[{_now_str()}] [TradeExecutor] 条件单已挂: {symbol} "
+                  f"触发价={trigger_price:.3f} 委托价={sell_price:.3f} 数量={volume} "
+                  f"cond_id={cond_id} remark={order_remark}")
+            return int(cond_id)
+        except AttributeError:
+            # 部分版本 xtquant 不支持 order_stock_condition
+            print(f"[{_now_str()}] [TradeExecutor] 警告：当前 xtquant 版本不支持条件单，跳过")
+            return -1
+        except Exception as e:
+            print(f"[{_now_str()}] [TradeExecutor] 条件单下单异常: {e}")
+            return -1
+
+    def cancel_condition_order(self, condition_order_id: int) -> bool:
+        """撤销条件单
+
+        Args:
+            condition_order_id: 条件单ID（由 place_condition_order 返回）
+
+        Returns:
+            是否成功
+        """
+        if not self._check_ready():
+            return False
+        if condition_order_id == -1:
+            return True  # 没有有效条件单，视为成功
+
+        try:
+            result = self._trader.cancel_order_stock_condition(
+                self._account, int(condition_order_id)
+            )
+            if result == 0 or result is True:
+                print(f"[{_now_str()}] [TradeExecutor] 条件单撤销成功: cond_id={condition_order_id}")
+                return True
+            else:
+                print(f"[{_now_str()}] [TradeExecutor] 条件单撤销失败: cond_id={condition_order_id} 返回={result}")
+                return False
+        except AttributeError:
+            print(f"[{_now_str()}] [TradeExecutor] 警告：当前 xtquant 版本不支持撤销条件单")
+            return False
+        except Exception as e:
+            print(f"[{_now_str()}] [TradeExecutor] 条件单撤销异常: {e}")
+            return False
+
 
 # ===========================================================================
 # SimulatedExecutor —— 模拟交易执行器（接口与 TradeExecutor 完全一致）
@@ -560,8 +647,23 @@ class SimulatedExecutor:
                 "price": record["price"],
                 "volume": record["volume"],
                 "traded_volume": record["volume"],  # 模拟全部成交
-                "status": 53,  # 已成交
+                "status": 56,  # ORDER_STATUS_FILLED=56 已成交
                 "remark": record["remark"],
             })
         print(f"[{_now_str()}] [SimulatedExecutor] [模拟查询订单] 共 {len(result)} 条")
         return result
+
+    # ------------------------------------------------------------------
+    # 条件单（模拟 stub，不实际挂单）
+    # ------------------------------------------------------------------
+    def place_condition_order(self, symbol: str, trigger_price: float, sell_price: float,
+                              volume: int, order_remark: str = '') -> int:
+        """模拟条件单（仅打印日志，返回 -1 表示模拟模式不实际挂单）"""
+        print(f"[{_now_str()}] [SimulatedExecutor] [模拟条件单] 跳过挂单: {symbol} "
+              f"触发价={trigger_price:.3f} 委托价={sell_price:.3f} 数量={volume}")
+        return -1  # 模拟模式不挂真实条件单
+
+    def cancel_condition_order(self, condition_order_id: int) -> bool:
+        """模拟撤销条件单（直接返回 True）"""
+        print(f"[{_now_str()}] [SimulatedExecutor] [模拟条件单] 跳过撤销: cond_id={condition_order_id}")
+        return True

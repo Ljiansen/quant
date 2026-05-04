@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>V3策略监控仪表盘</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #1a1a2e; color: #e0e0e0; font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; font-size: 14px; }
@@ -65,6 +66,33 @@ a { color: inherit; text-decoration: none; }
 .panel-badge { font-size: 12px; color: #888; background: #0f3460; padding: 2px 8px; border-radius: 10px; }
 .panel-body { padding: 0; overflow: auto; }
 
+/* ---- 参数编辑表单 ---- */
+.cfg-edit-btn, .cfg-save-btn, .cfg-cancel-btn {
+  padding: 4px 14px; border-radius: 4px; border: none;
+  font-size: 13px; cursor: pointer; transition: all .2s;
+}
+.cfg-edit-btn   { background: #0f3460; color: #aaa; border: 1px solid #0f3460; }
+.cfg-edit-btn:hover { background: #1a5276; color: #fff; }
+.cfg-save-btn   { background: #e94560; color: #fff; margin-left: 6px; }
+.cfg-save-btn:hover { background: #c0392b; }
+.cfg-cancel-btn { background: transparent; color: #888; border: 1px solid #444; margin-left: 4px; }
+.cfg-cancel-btn:hover { color: #fff; border-color: #888; }
+.cfg-msg { font-size: 12px; margin-left: 12px; }
+.cfg-msg.ok  { color: #00e676; }
+.cfg-msg.err { color: #ff4444; }
+.cfg-meta { font-size: 11px; color: #555; margin-left: 10px; }
+.cfg-input {
+  width: 72px; background: #0f3460; border: 1px solid #1a4a7a;
+  color: #e0e0e0; border-radius: 3px; padding: 2px 6px;
+  font-size: 13px; text-align: right;
+  transition: border-color .2s;
+}
+.cfg-input:disabled { background: transparent; border-color: transparent; color: #ccc; cursor: default; }
+.cfg-input:focus    { outline: none; border-color: #e94560; }
+.cfg-input.readonly { pointer-events: none; }
+.cfg-unit { color: #888; font-size: 12px; margin-left: 2px; }
+.cfg-hint { font-size: 11px; color: #555; display: block; margin-top: 2px; }
+
 /* ---- 表格 ---- */
 table { width: 100%; border-collapse: collapse; }
 th {
@@ -113,7 +141,8 @@ tr:hover td { background: rgba(233,69,96,.08); }
 .chg-na { color: #555; }
 .stock-name { display: block; font-size: 11px; color: #888; margin-top: 2px; font-weight: normal; }
 
-/* ---- 进程监控栏 ---- */
+/* ---- 进程监控栏（已禁用）---- */
+#proc-bar { display: none !important; }
 .proc-bar {
   background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
   padding: 10px 20px; margin-bottom: 16px;
@@ -148,6 +177,7 @@ tr:hover td { background: rgba(233,69,96,.08); }
 /* ---- 参数表 ---- */
 .config-table th:first-child { width: 180px; }
 .config-table td:first-child { color: #aaa; }
+.row-num { color: #555; font-size: 11px; width: 28px; text-align: center; user-select: none; }
 
 /* ---- 两列布局 ---- */
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
@@ -159,6 +189,71 @@ tr:hover td { background: rgba(233,69,96,.08); }
 @media(max-width:560px){
   .cards { grid-template-columns: 1fr; }
 }
+
+/* ---- 选股说明 tooltip ---- */
+.info-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #0f3460; border: 1px solid #1a5276;
+  color: #5599cc; font-size: 11px; font-weight: 700; line-height: 1;
+  cursor: help; position: relative; user-select: none; flex-shrink: 0;
+}
+.info-icon .tooltip-box {
+  display: none;
+  position: fixed;
+  background: #0d2137; border: 1px solid #1a5276; border-radius: 6px;
+  padding: 12px 16px; width: 340px;
+  font-size: 12px; color: #c0d8f0; line-height: 1.9;
+  z-index: 9999; box-shadow: 0 6px 24px rgba(0,0,0,.7);
+  white-space: normal; text-align: left;
+  pointer-events: none;
+}
+.info-icon:hover .tooltip-box { /* position controlled by JS */ }
+.tooltip-title { font-weight: 700; color: #88bbff; margin-bottom: 8px; font-size: 13px; display:block; }
+.tooltip-step  { margin-bottom: 5px; }
+.tooltip-step b { color: #ffcc66; }
+
+/* ---- 策略切换按钮 ---- */
+.pool-s-btn {
+  padding: 3px 10px; border-radius: 4px; border: 1px solid #0f3460;
+  background: transparent; color: #888; cursor: pointer; font-size: 12px;
+  transition: all .2s;
+}
+.pool-s-btn:hover:not(.active):not(:disabled) { background: #0f3460; color: #ccc; }
+.pool-s-btn.active { background: #1a4a7a; border-color: #5599cc; color: #88bbff; font-weight: 600; }
+.pool-s-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ---- 模拟盘专属 ---- */
+.sim-select {
+  background: #0f3460; border: 1px solid #1a5276; color: #e0e0e0;
+  border-radius: 4px; padding: 4px 10px; font-size: 13px;
+  max-width: 560px; width: 100%;
+}
+.sim-select:focus { outline: none; border-color: #e94560; }
+.sim-del-btn {
+  padding: 4px 12px; border-radius: 4px; border: 1px solid #ff4444;
+  background: transparent; color: #ff4444; cursor: pointer; font-size: 13px;
+  white-space: nowrap; transition: all .2s;
+}
+.sim-del-btn:hover { background: #ff4444; color: #fff; }
+.sim-del-btn:disabled { opacity: .4; cursor: not-allowed; }
+.sim-empty-hint {
+  color: #888; font-size: 14px; padding: 40px; text-align: center;
+}
+.sim-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+@media(max-width:900px){ .sim-cards { grid-template-columns: repeat(2,1fr); } }
+@media(max-width:560px){ .sim-cards { grid-template-columns: 1fr; } }
+.sim-stat-label { font-size: 11px; color: #888; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
+.sim-stat-value { font-size: 20px; font-weight: 700; }
+.sim-stat-sub   { font-size: 12px; color: #888; margin-top: 3px; }
+#equity-canvas  { max-height: 320px; }
+.sim-cfg-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.sim-cfg-block { flex: 1; min-width: 280px; }
+.sim-cfg-block table { width: 100%; }
+.sim-cfg-block th { font-size: 12px; color: #e94560; font-weight: 700;
+  padding: 8px 12px; background: #1a1a2e; border-bottom: 1px solid #0f3460; }
+.sim-cfg-block td:first-child { color: #aaa; width: 140px; }
+.sim-cfg-block td { padding: 7px 12px; border-bottom: 1px solid #0f3460; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -181,33 +276,8 @@ tr:hover td { background: rgba(233,69,96,.08); }
 <!-- 主内容 -->
 <div class="main">
 
-<!-- 进程监控栏 -->
-  <div class="proc-bar" id="proc-bar">
-    <span class="proc-bar-title">&#9881; 进程监控</span>
-    <!-- 模拟盘 -->
-    <div class="proc-item">
-      <div class="proc-dot proc-dot-stop" id="proc-dot-sim"></div>
-      <span class="proc-name">模拟盘</span>
-      <span class="proc-status-text proc-status-stop" id="proc-status-sim">已停止</span>
-      <span class="proc-pid" id="proc-pid-sim"></span>
-      <button class="proc-btn proc-btn-start" id="proc-btn-start-sim" onclick="procStart('sim')">&#9654; 启动</button>
-      <button class="proc-btn proc-btn-stop"  id="proc-btn-stop-sim"  onclick="procStop('sim')" style="display:none">■ 停止</button>
-    </div>
-    <div style="width:1px;height:28px;background:#0f3460;"></div>
-    <!-- 实盘 -->
-    <div class="proc-item">
-      <div class="proc-dot proc-dot-stop" id="proc-dot-live"></div>
-      <span class="proc-name">实盘</span>
-      <span class="proc-status-text proc-status-stop" id="proc-status-live">已停止</span>
-      <span class="proc-pid" id="proc-pid-live"></span>
-      <button class="proc-btn proc-btn-start" id="proc-btn-start-live" onclick="procStart('live')">&#9654; 启动</button>
-      <button class="proc-btn proc-btn-stop"  id="proc-btn-stop-live"  onclick="procStop('live')" style="display:none">■ 停止</button>
-    </div>
-    <span class="proc-msg" id="proc-msg"></span>
-  </div>
-
   <!-- 模块A: 概览卡片 -->
-  <div class="cards">
+  <div class="cards" id="main-cards">
     <div class="card">
       <div class="card-label">总资产</div>
       <div class="card-value" id="c-total">--</div>
@@ -230,6 +300,8 @@ tr:hover td { background: rgba(233,69,96,.08); }
     </div>
   </div>
 
+  <!-- 模块B: 当前持仓（实盘专属） -->
+  <div id="live-sections">
   <!-- 模块B: 当前持仓 -->
   <div class="panel">
     <div class="panel-header">
@@ -240,13 +312,13 @@ tr:hover td { background: rgba(233,69,96,.08); }
       <table>
         <thead>
           <tr>
-            <th>代码</th><th>板块</th><th>买入价</th><th>持仓数量</th>
+            <th>#</th><th>代码</th><th>板块</th><th>买入价</th><th>当前价</th><th>持仓数量</th>
             <th>持仓市值</th><th>盈亏%</th><th>持仓天数</th>
             <th>止损线</th><th>移动止盈触发</th><th>状态</th>
           </tr>
         </thead>
         <tbody id="pos-tbody">
-          <tr class="empty-row"><td colspan="10">暂无持仓</td></tr>
+          <tr class="empty-row"><td colspan="12">暂无持仓</td></tr>
         </tbody>
       </table>
     </div>
@@ -256,18 +328,33 @@ tr:hover td { background: rgba(233,69,96,.08); }
   <div class="two-col">
     <!-- 候选买入 -->
     <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">候选买入</span>
-        <span class="panel-badge" id="cand-count">0 只</span>
+      <div class="panel-header" style="flex-wrap:wrap;gap:8px;">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="panel-title">候选买入</span>
+          <div class="info-icon" id="pool-info-icon" onmouseenter="_posTooltip(this)" onmouseleave="_hideTooltip(this)">?<div class="tooltip-box" id="pool-tooltip-box">
+              <span class="tooltip-title">&#x1F4CB; 每日选股逻辑（B+A策略）</span>
+              <div class="tooltip-step"><b>① 趋势过滤（B）</b>：收盘价 &gt; MA20（20日均线），确保股票处于上升趋势，排除弱势股</div>
+              <div class="tooltip-step"><b>② 信号质量评分（A）</b>：统计近60个交易日内，日涨幅在 1%~7% 且当日收阳（收盘&gt;开盘）的天数，天数越多说明上涨信号越稳定</div>
+              <div class="tooltip-step"><b>③ 取 Top 50</b>：按评分排名取前 50 只，作为次日候选买入池</div>
+              <div style="margin-top:8px;color:#7aabcc;font-size:11px;">&#x23F0; 每天收盘后自动刷新，次日开盘监控 5 分钟线买入信号</div>
+            </div></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <span id="pool-strategy-msg" style="font-size:11px;color:#888;"></span>
+          <span class="panel-badge" id="cand-count">0 只</span>
+        </div>
+      </div>
+      <div id="pool-rebuild-bar" style="display:none;padding:8px 20px;font-size:12px;color:#ffab40;border-bottom:1px solid #0f3460;background:rgba(255,171,64,.05);">
+        &#9203; <span id="pool-rebuild-msg">选股进行中，请稍候...</span>
       </div>
       <div class="panel-body">
         <table>
           <thead><tr>
-            <th>代码</th><th>板块</th><th>当前价</th>
+            <th>#</th><th>代码</th><th>板块</th><th>当前价</th>
             <th>涨跌幅%</th><th>收阳</th><th>买入阈値</th><th>状态</th>
           </tr></thead>
           <tbody id="cand-tbody">
-            <tr class="empty-row"><td colspan="7">暂无候选</td></tr>
+            <tr class="empty-row"><td colspan="8">暂无候选</td></tr>
           </tbody>
         </table>
       </div>
@@ -282,15 +369,103 @@ tr:hover td { background: rgba(233,69,96,.08); }
       <div class="panel-body">
         <table>
           <thead>
-            <tr><th>代码</th><th>卖出原因</th><th>买入价</th><th>持仓天数</th><th>执行方式</th></tr>
+            <tr><th>#</th><th>代码</th><th>卖出原因</th><th>买入价</th><th>持仓天数</th><th>执行方式</th></tr>
           </thead>
           <tbody id="sell-tbody">
-            <tr class="empty-row"><td colspan="5">暂无待卖出</td></tr>
+            <tr class="empty-row"><td colspan="6">暂无待卖出</td></tr>
           </tbody>
         </table>
       </div>
     </div>
   </div>
+
+  <!-- 模块E+: 最近60天新股 -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">最近60天新股 <small style="font-size:11px;color:#555;font-weight:normal">添新排列</small></span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="new-stock-loading-txt" style="font-size:12px;color:#888;display:none">&#9679; 数据加载中...</span>
+        <span class="panel-badge" id="new-stock-count">0 只</span>
+      </div>
+    </div>
+    <div class="panel-body">
+      <table>
+        <thead><tr>
+          <th>#</th><th>代码</th><th>板块</th><th>上市日期</th>
+          <th>当前价</th><th>今日涨跌幅</th>
+        </tr></thead>
+        <tbody id="new-stock-tbody">
+          <tr class="empty-row"><td colspan="6">暂无数据</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 模块E: 历史交易 -->
+  </div><!-- /live-sections -->
+
+  <!-- 模块F′: 模拟盘专属区块 -->
+  <div id="sim-sections" style="display:none">
+
+    <!-- F1: 模拟结果选择器 -->
+    <div class="panel" id="sim-selector-panel">
+      <div class="panel-header">
+        <span class="panel-title">模拟结果</span>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <select class="sim-select" id="sim-run-select" onchange="loadSimDetail(this.value)">
+            <option value="">— 暂无模拟存档 —</option>
+          </select>
+          <button class="sim-del-btn" id="sim-del-btn" onclick="deleteSimResult()" disabled>🗑 删除此次</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- F2: 模拟摘要卡片 -->
+    <div class="sim-cards" id="sim-summary-cards" style="display:none">
+      <div class="card">
+        <div class="sim-stat-label">最终总资产</div>
+        <div class="sim-stat-value" id="ss-final">--</div>
+        <div class="sim-stat-sub">初始资金: <span id="ss-init">--</span></div>
+      </div>
+      <div class="card">
+        <div class="sim-stat-label">累计收益</div>
+        <div class="sim-stat-value" id="ss-profit">--</div>
+        <div class="sim-stat-sub"><span id="ss-profit-pct">--</span></div>
+      </div>
+      <div class="card">
+        <div class="sim-stat-label">胜率 / 最大回撤</div>
+        <div class="sim-stat-value" id="ss-winrate">--</div>
+        <div class="sim-stat-sub">最大回撤: <span id="ss-maxdd">--</span></div>
+      </div>
+      <div class="card">
+        <div class="sim-stat-label">交易统计</div>
+        <div class="sim-stat-value" id="ss-trades">--</div>
+        <div class="sim-stat-sub">交易日: <span id="ss-days">--</span></div>
+      </div>
+    </div>
+
+    <!-- F3: 净值曲线 -->
+    <div class="panel" id="sim-chart-panel" style="display:none">
+      <div class="panel-header">
+        <span class="panel-title">净值曲线</span>
+        <span class="panel-badge" id="ss-date-range"></span>
+      </div>
+      <div class="panel-body" style="padding:16px">
+        <canvas id="equity-canvas"></canvas>
+      </div>
+    </div>
+
+    <!-- F4: 本次模拟使用的参数（只读） -->
+    <div class="panel" id="sim-params-panel" style="display:none">
+      <div class="panel-header">
+        <span class="panel-title">本次模拟参数（只读）</span>
+      </div>
+      <div class="panel-body" style="padding:16px">
+        <div class="sim-cfg-row" id="sim-cfg-row"></div>
+      </div>
+    </div>
+
+  </div><!-- /sim-sections -->
 
   <!-- 模块E: 历史交易 -->
   <div class="panel">
@@ -302,8 +477,8 @@ tr:hover td { background: rgba(233,69,96,.08); }
       <table>
         <thead>
           <tr>
-            <th>时间</th><th>代码</th><th>方向</th><th>价格</th>
-            <th>数量</th><th>金额</th><th>手续费</th><th>原因</th><th>交易后现金</th>
+            <th>#</th><th>时间</th><th>代码</th><th>方向</th><th>价格</th>
+            <th>数量</th><th>金额</th><th>原因</th><th>盈亏</th>
           </tr>
         </thead>
         <tbody id="trade-tbody">
@@ -314,22 +489,26 @@ tr:hover td { background: rgba(233,69,96,.08); }
   </div>
 
   <!-- 模块F: 策略参数 -->
-  <div class="panel">
+  <div class="panel" id="cfg-panel">
     <div class="panel-header">
-      <span class="panel-title">策略参数</span>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="panel-title">策略参数</span>
+        <span class="cfg-meta" id="cfg-meta-txt"></span>
+      </div>
+      <div style="display:flex;align-items:center">
+        <span class="cfg-msg" id="cfg-msg"></span>
+      </div>
     </div>
     <div class="panel-body">
       <table class="config-table">
         <thead>
           <tr>
-            <th>参数</th>
+            <th style="width:130px">参数</th>
             <th>主板 (60/00)</th>
             <th>科创/创业板 (688/30)</th>
           </tr>
         </thead>
-        <tbody id="cfg-tbody">
-          <tr class="empty-row"><td colspan="3">加载中...</td></tr>
-        </tbody>
+        <tbody id="cfg-tbody"></tbody>
       </table>
     </div>
   </div>
@@ -380,6 +559,15 @@ const REASON_MAP = {
 function reasonCN(r) {
   return REASON_MAP[r] || r || '--';
 }
+function pnlCell(pnl, pnlPct) {
+  if (pnl == null) return '--';
+  const isPos = pnl >= 0;
+  const color = isPos ? '#ff4444' : '#00c853';
+  const sign  = isPos ? '+' : '';
+  const pct   = pnlPct != null ? ` (${sign}${Number(pnlPct).toFixed(2)}%)` : '';
+  return `<span style="color:${color};font-weight:600">${sign}¥${fmt(Math.abs(pnl))}${pct}</span>`;
+}
+
 function reasonTag(r) {
   const label = reasonCN(r);
   let cls = 'reason-other';
@@ -397,17 +585,137 @@ function switchMode(mode) {
   document.getElementById('tab-sim').classList.toggle('active', mode === 'sim');
   document.getElementById('tab-live').classList.toggle('active', mode === 'live');
   document.getElementById('c-mode-label').textContent = mode === 'sim' ? '模拟盘' : '实盘';
+  // 展示 / 隐藏区块
+  const isLive = mode === 'live';
+  document.getElementById('live-sections').style.display    = isLive ? '' : 'none';
+  document.getElementById('sim-sections').style.display     = isLive ? 'none' : '';
+  document.getElementById('main-cards').style.display       = isLive ? '' : 'none';
+  document.getElementById('cfg-panel').style.display        = isLive ? '' : 'none';
   refreshAll();
 }
 
 // ==================== 刷新所有 ====================
 function refreshAll() {
+  if (currentMode === 'sim') {
+    loadSimList();
+    resetCountdown();
+    return;
+  }
   loadStatus();
   loadTrades();
   loadCandidates();
+  loadNewStocks();
   loadConfig();
-  loadProcesses();
+  loadPoolStatus();
   resetCountdown();
+}
+
+// ==================== Tooltip 定位 ====================
+function _posTooltip(iconEl) {
+  const box = iconEl.querySelector('.tooltip-box');
+  if (!box) return;
+  const rect = iconEl.getBoundingClientRect();
+  box.style.display = 'block';
+  // 优先显示在图标下方
+  let top = rect.bottom + 8;
+  let left = rect.left;
+  // 防止超出右边界
+  const bw = 340;
+  if (left + bw > window.innerWidth - 12) left = window.innerWidth - bw - 12;
+  if (left < 8) left = 8;
+  // 如果下方空间不够，改为显示在上方
+  if (top + 160 > window.innerHeight) top = rect.top - 160 - 8;
+  box.style.top  = top + 'px';
+  box.style.left = left + 'px';
+}
+function _hideTooltip(iconEl) {
+  const box = iconEl.querySelector('.tooltip-box');
+  if (box) box.style.display = 'none';
+}
+
+// ==================== 选股池策略 ====================
+let _poolStrategy = 'ba';
+let _poolPollTimer = null;
+
+async function loadPoolStatus() {
+  const data = await fetchJSON('/api/pool/status');
+  if (!data) return;
+  _poolStrategy = data.strategy || 'ba';
+  ['ba', 'a', 'b'].forEach(s => {
+    const btn = document.getElementById('ps-' + s);
+    if (btn) btn.classList.toggle('active', s === _poolStrategy);
+  });
+  const msgEl = document.getElementById('pool-strategy-msg');
+  if (msgEl) {
+    if (data.last_rebuild) msgEl.textContent = '更新 ' + data.last_rebuild;
+    else if (data.rebalance_date) msgEl.textContent = '调仓日 ' + data.rebalance_date;
+  }
+  if (data.rebuilding) {
+    _showRebuildBar(data.last_msg || '选股进行中...');
+    if (!_poolPollTimer) _poolPollTimer = setInterval(_pollRebuildStatus, 5000);
+  } else {
+    _hideRebuildBar();
+    if (_poolPollTimer) { clearInterval(_poolPollTimer); _poolPollTimer = null; }
+  }
+}
+
+function _showRebuildBar(msg) {
+  const bar = document.getElementById('pool-rebuild-bar');
+  const msgEl = document.getElementById('pool-rebuild-msg');
+  if (bar) bar.style.display = '';
+  if (msgEl) msgEl.textContent = msg;
+  ['ba', 'a', 'b'].forEach(s => {
+    const btn = document.getElementById('ps-' + s);
+    if (btn) btn.disabled = true;
+  });
+}
+
+function _hideRebuildBar() {
+  const bar = document.getElementById('pool-rebuild-bar');
+  if (bar) bar.style.display = 'none';
+  ['ba', 'a', 'b'].forEach(s => {
+    const btn = document.getElementById('ps-' + s);
+    if (btn) btn.disabled = false;
+  });
+}
+
+async function _pollRebuildStatus() {
+  const data = await fetchJSON('/api/pool/status');
+  if (!data) return;
+  if (data.rebuilding) {
+    _showRebuildBar(data.last_msg || '选股进行中...');
+  } else {
+    clearInterval(_poolPollTimer);
+    _poolPollTimer = null;
+    _hideRebuildBar();
+    _poolStrategy = data.strategy || 'ba';
+    ['ba', 'a', 'b'].forEach(s => {
+      const btn = document.getElementById('ps-' + s);
+      if (btn) btn.classList.toggle('active', s === _poolStrategy);
+    });
+    const msgEl = document.getElementById('pool-strategy-msg');
+    if (msgEl && data.last_msg) msgEl.textContent = data.last_msg;
+    loadCandidates();  // 重载候选列表
+  }
+}
+
+async function switchPoolStrategy(strategy) {
+  if (strategy === _poolStrategy) return;
+  const nameMap = {'ba': 'B+A（最优组合）', 'a': '仅A（信号质量）', 'b': '仅B（趋势MA20）'};
+  if (!confirm('切换到「' + (nameMap[strategy]||strategy) + '」策略？\n选股约需2分钟，期间候选池暂停更新，请稍候。')) return;
+  try {
+    const r = await fetch('/api/pool/rebuild', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({strategy})
+    });
+    const data = await r.json();
+    if (!data.ok) { alert(data.msg || '操作失败'); return; }
+    _showRebuildBar(data.msg || '选股进行中...');
+    if (!_poolPollTimer) _poolPollTimer = setInterval(_pollRebuildStatus, 5000);
+  } catch(e) {
+    alert('请求失败: ' + e);
+  }
 }
 
 // ==================== 倒计时 ====================
@@ -473,7 +781,7 @@ function renderPositions(positions, statusData) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="10">暂无持仓</td></tr>';
     return;
   }
-  tbody.innerHTML = positions.map(p => {
+  tbody.innerHTML = positions.map((p, i) => {
     const code = p.code || p.stock_code || '';
     const name = p.name || '';
     const buyPrice = p.buy_price || p.cost || 0;
@@ -520,9 +828,11 @@ function renderPositions(positions, statusData) {
     }
 
     return `<tr>
+      <td class="row-num">${i+1}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${boardTag(code)}</td>
       <td>${fmt(buyPrice)}</td>
+      <td>${curPrice ? fmt(curPrice) : '<span style="color:#555">--</span>'}</td>
       <td>${qtyHtml}</td>
       <td>¥${fmt(mktVal)}</td>
       <td>${pnlHtml}</td>
@@ -548,7 +858,7 @@ function renderPendingSells(pendingSells, positions) {
     posMap[code] = p;
   });
 
-  tbody.innerHTML = pendingSells.map(s => {
+  tbody.innerHTML = pendingSells.map((s, i) => {
     const code = s.code || s.stock_code || '';
     const name = s.name || '';
     const reason = s.reason || s.sell_reason || '';
@@ -557,6 +867,7 @@ function renderPendingSells(pendingSells, positions) {
     const days = s.hold_days || pos.hold_days || pos.days || '--';
     const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
     return `<tr>
+      <td class="row-num">${i+1}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${reasonTag(reason)}</td>
       <td>${buyPrice !== '--' ? fmt(buyPrice) : '--'}</td>
@@ -576,7 +887,7 @@ async function loadTrades() {
     return;
   }
   document.getElementById('trade-count').textContent = data.length + ' 条';
-  tbody.innerHTML = data.map(t => {
+  tbody.innerHTML = data.map((t, i) => {
     const action = t.action || t.direction || t.type || '';
     const isBuy = action === 'buy';
     const dirLabel = isBuy
@@ -593,15 +904,15 @@ async function loadTrades() {
     const cash = t.cash_after || t.remaining_cash || '';
     const time = t.time || t.timestamp || t.date || '';
     return `<tr>
+      <td class="row-num">${i+1}</td>
       <td>${time}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${dirLabel}</td>
       <td>${fmt(price)}</td>
       <td>${qty.toLocaleString()}</td>
       <td>¥${fmt(amount)}</td>
-      <td>¥${fmt(commission)}</td>
       <td>${reasonTag(reason)}</td>
-      <td>${cash !== '' ? '¥' + fmt(cash) : '--'}</td>
+      <td>${!isBuy && t.pnl != null ? pnlCell(t.pnl, t.pnl_pct) : '--'}</td>
     </tr>`;
   }).join('');
 }
@@ -616,7 +927,7 @@ async function loadCandidates() {
     return;
   }
   document.getElementById('cand-count').textContent = data.candidates.length + ' 只';
-  tbody.innerHTML = data.candidates.map(c => {
+  tbody.innerHTML = data.candidates.map((c, i) => {
     const code = c.code || '';
     const name = c.name || '';
     const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
@@ -633,6 +944,7 @@ async function loadCandidates() {
     else if (statusText === '涨幅不足' || statusText === '收阴') statusCls = 'status-dim';
     const rowStyle = c.meets_buy_condition ? ' style="background:rgba(0,230,118,.06);"' : '';
     return `<tr${rowStyle}>
+      <td class="row-num">${(c.pool_rank !== undefined ? c.pool_rank + 1 : i+1)}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${boardTag(code)}</td>
       <td>${priceStr}</td>
@@ -644,8 +956,70 @@ async function loadCandidates() {
   }).join('');
 }
 
+// ---- 新股监控 ----
+async function loadNewStocks() {
+  const data = await fetchJSON('/api/new_stocks');
+  const tbody = document.getElementById('new-stock-tbody');
+  const loadingTxt = document.getElementById('new-stock-loading-txt');
+  const countEl  = document.getElementById('new-stock-count');
+
+  if (!data) {
+    countEl.textContent = '0 只';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">数据获取失败</td></tr>';
+    return;
+  }
+  if (data.xt_offline) {
+    countEl.textContent = '0 只';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">miniQMT 未连接，无法获取新股数据</td></tr>';
+    if (loadingTxt) loadingTxt.style.display = 'none';
+    return;
+  }
+  if (loadingTxt) loadingTxt.style.display = data.loading ? '' : 'none';
+
+  const stocks = data.stocks || [];
+  const loadingSuffix = data.loading ? ' (更新中...)' : '';
+  countEl.textContent = stocks.length + ' 只' + loadingSuffix;
+
+  if (!stocks.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">' +
+      (data.loading ? '数据扫描中，首次加载请稍候刷新...' : '最近60天暂无新股上市') + '</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = stocks.map((s, i) => {
+    const code     = s.code || '';
+    const name     = s.name || '';
+    const openDate = s.open_date || '--';
+    const pct      = s.change_pct;
+    const price    = s.last_price;
+    const nameHtml = name ? `<span class="stock-name">${name}</span>` : '';
+    const pctStr   = (pct !== null && pct !== undefined)
+      ? `<span class="${pct >= 0 ? 'chg-up' : 'chg-dn'}">${pct >= 0 ? '+' : ''}${Number(pct).toFixed(2)}%</span>`
+      : '<span class="chg-na">--</span>';
+    const priceStr = (price !== null && price !== undefined) ? Number(price).toFixed(2) : '--';
+    // 计算上市天数
+    let daysHtml = '';
+    if (s.open_date && s.open_date !== '--') {
+      const daysAgo = Math.floor((Date.now() - new Date(s.open_date)) / 86400000);
+      daysHtml = `<small style="color:#888;font-size:11px;display:block">上市${daysAgo}天</small>`;
+    }
+    return `<tr>
+      <td class="row-num">${i+1}</td>
+      <td><b>${code}</b>${nameHtml}</td>
+      <td>${boardTag(code)}</td>
+      <td>${openDate}${daysHtml}</td>
+      <td>${priceStr}</td>
+      <td>${pctStr}</td>
+    </tr>`;
+  }).join('');
+}
+
 // ---- 策略参数 ----
+let _cfgData = null;    // 当前加载的参数（用于取消恢复）
+let _cfgEditing = false;
+
 async function loadConfig() {
+  if (_cfgEditing) return;  // 编辑中不自动覆盖
   const data = await fetchJSON('/api/config');
   const tbody = document.getElementById('cfg-tbody');
   if (!data || data.error) {
@@ -653,26 +1027,174 @@ async function loadConfig() {
     return;
   }
   configData = data;   // 缓存全局，供 renderPositions 使用
+  _cfgData = JSON.parse(JSON.stringify(data));  // 深拷贝备用
+  // 显示上次修改时间
+  const meta = data._meta || {};
+  const metaEl = document.getElementById('cfg-meta-txt');
+  if (meta.last_modified) {
+    metaEl.textContent = '\u4e0a次修改: ' + meta.last_modified;
+  } else {
+    metaEl.textContent = '（未修改过，使用 config.py 默认值）';
+  }
+  _cfgRender(data, _cfgEditing);
+}
+
+function _cfgRender(data, editable) {
+  const tbody = document.getElementById('cfg-tbody');
   const m = data.main_board || {};
   const s = data.star_board || {};
-  const g = data.general || {};
-
+  const g = data.general   || {};
+  // 行定义: [label, mainKey, starKey, type, unit, hint]
+  // type: 'pct'=百分比输入(乘100显示), 'days'=整数天数, 'int'=整数, 'ro'=只读
   const rows = [
-    ['买入涨幅',      '>' + pctStr(m.min_change_pct),              '>' + pctStr(s.min_change_pct)],
-    ['移动止盈激活',    '+' + pctStr(m.trailing_activate || 0.03),   '+' + pctStr(s.trailing_activate || 0.08)],
-    ['移动止盈回撤',    '-' + pctStr(m.trailing_stop     || 0.02),   '-' + pctStr(s.trailing_stop     || 0.05)],
-    ['硬止损',          '-' + pctStr(m.hard_stop_loss),              '-' + pctStr(s.hard_stop_loss)],
-    ['阴跌止损',        '-' + pctStr(m.soft_stop_loss),              '-' + pctStr(s.soft_stop_loss)],
-    ['时间止损',        (m.time_stop_days || '--') + ' 天',           (s.time_stop_days || '--') + ' 天'],
-    ['涨停保护',         pctStr(m.limit_up),                          pctStr(s.limit_up)],
-    ['最大持仓数', (g.max_positions || '--') + ' 只', '—'],
-    ['选股池大小', (g.top_n || '--') + ' 只',         '—'],
-    ['买入时间',   g.buy_time || '--',               '—'],
+    ['买入涨幅',     'min_change_pct',    'min_change_pct',    'pct',  '%',   '>X% 且收阳线才买入'],
+    ['防追高上限',   'max_change_pct',    'max_change_pct',    'pct',  '%',   '涨幅超过X%视为追高，不买入'],
+    ['移动止盈激活',  'trailing_activate', 'trailing_activate', 'pct',  '%',   '浮盈超过X%后开始追踪'],
+    ['移动止盈回撤',  'trailing_stop',     'trailing_stop',     'pct',  '%',   '从最高价回撤X%触发卖出'],
+    ['硬止损',       'hard_stop_loss',    'hard_stop_loss',    'pct',  '%',   '下跌X%当天收盘价卖出'],
+    ['阴跌止损',       'soft_stop_loss',    'soft_stop_loss',    'pct',  '%',   '收阴X%且低于买入价'],
+    ['时间止损',       'time_stop_days',    'time_stop_days',    'days', '天',  '持仓N天无赛则离场'],
+    ['涨停保护',       'limit_up',          'limit_up',          'pct',  '%',   '超过X%认为涨停，不买入'],
+        ['最大持仓数',   null,                null,                'int-general', '只', '同时最多持有N只'],
+        ['前K线非阴线过滤', null, null, 'bool-general', '', '买入前要求上一根5分钟K线非阴线（close≥open），可降低追高风险'],
+    ['选股池大小',   null,                null,                'ro-general',  '只', '需重新运行生效'],
   ];
 
-  tbody.innerHTML = rows.map((r, i) =>
-    `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`
-  ).join('');
+  function cell(val, key, section, type, unit) {
+    const idStr = `cfg_${section}_${key}`;
+    if (type === 'ro' || section === 'ro-general' || section === 'ro-general-time') {
+      return `<span style="color:#888">${val}</span>`;
+    }
+    const dispVal = (type === 'pct') ? (val * 100).toFixed(1) : String(val);
+    const dis = editable ? '' : 'disabled';
+    return `<input class="cfg-input" id="${idStr}" type="number" step="${type==='pct'?'0.1':'1'}" value="${dispVal}" ${dis}><span class="cfg-unit">${unit}</span>`;
+  }
+
+  tbody.innerHTML = rows.map(([label, mKey, sKey, type, unit, hint]) => {
+    let mCell, sCell;
+    if (type === 'bool-general') {
+      const idStr = 'cfg_general_prev_bar_up';
+      const dis = editable ? '' : 'disabled';
+      const isOn = (g.prev_bar_up === 1 || g.prev_bar_up === true);
+      mCell = `<label style="cursor:${editable?'pointer':'default'}"><input type="checkbox" id="${idStr}" ${isOn?'checked':''} ${dis} style="width:auto;margin-right:4px">开启</label>`;
+      sCell = '<span style="color:#555">—</span>';
+    } else if (type === 'int-general') {
+      const idStr = 'cfg_general_max_positions';
+      const dis = editable ? '' : 'disabled';
+      mCell = `<input class="cfg-input" id="${idStr}" type="number" step="1" value="${g.max_positions||3}" ${dis}><span class="cfg-unit">${unit}</span>`;
+      sCell = '<span style="color:#555">—</span>';
+    } else if (type === 'ro-general') {
+      mCell = `<span style="color:#888">${g.top_n||50} ${unit}</span>`;
+      sCell = '<span style="color:#555">—</span>';
+    } else {
+      mCell = cell(m[mKey], mKey, 'main', type, unit);
+      sCell = cell(s[sKey], sKey, 'star', type, unit);
+    }
+    const hintHtml = hint ? `<small class="cfg-hint">${hint}</small>` : '';
+    return `<tr><td>${label}${hintHtml}</td><td>${mCell}</td><td>${sCell}</td></tr>`;
+  }).join('');
+}
+
+function cfgStartEdit() {
+  _cfgEditing = true;
+  document.getElementById('cfg-edit-btn').style.display   = 'none';
+  document.getElementById('cfg-save-btn').style.display   = '';
+  document.getElementById('cfg-cancel-btn').style.display = '';
+  _cfgRender(_cfgData, true);
+  _cfgShowMsg('', '');
+}
+
+function cfgCancel() {
+  _cfgEditing = false;
+  document.getElementById('cfg-edit-btn').style.display   = '';
+  document.getElementById('cfg-save-btn').style.display   = 'none';
+  document.getElementById('cfg-cancel-btn').style.display = 'none';
+  _cfgRender(_cfgData, false);
+  _cfgShowMsg('', '');
+}
+
+function _cfgShowMsg(msg, type) {
+  const el = document.getElementById('cfg-msg');
+  el.textContent = msg;
+  el.className = 'cfg-msg' + (type ? ' ' + type : '');
+  if (type === 'ok') setTimeout(() => { el.textContent = ''; el.className = 'cfg-msg'; }, 4000);
+}
+
+async function cfgSave() {
+  // 从 DOM 收集参数
+  function getVal(id, asFloat) {
+    const el = document.getElementById(id);
+    if (!el) return null;
+    return asFloat ? parseFloat(el.value) : parseInt(el.value, 10);
+  }
+  function getPct(id) { const v = getVal(id, true); return isNaN(v) ? null : v / 100; }
+  function getInt(id) { const v = getVal(id, false); return isNaN(v) ? null : v; }
+
+  const payload = {
+    main_board: {
+      min_change_pct:    getPct('cfg_main_min_change_pct'),
+      max_change_pct:    getPct('cfg_main_max_change_pct'),
+      trailing_activate: getPct('cfg_main_trailing_activate'),
+      trailing_stop:     getPct('cfg_main_trailing_stop'),
+      hard_stop_loss:    getPct('cfg_main_hard_stop_loss'),
+      soft_stop_loss:    getPct('cfg_main_soft_stop_loss'),
+      time_stop_days:    getInt('cfg_main_time_stop_days'),
+      limit_up:          getPct('cfg_main_limit_up'),
+      take_profit:       (_cfgData.main_board||{}).take_profit || 0.05,
+    },
+    star_board: {
+      min_change_pct:    getPct('cfg_star_min_change_pct'),
+      max_change_pct:    getPct('cfg_star_max_change_pct'),
+      trailing_activate: getPct('cfg_star_trailing_activate'),
+      trailing_stop:     getPct('cfg_star_trailing_stop'),
+      hard_stop_loss:    getPct('cfg_star_hard_stop_loss'),
+      soft_stop_loss:    getPct('cfg_star_soft_stop_loss'),
+      time_stop_days:    getInt('cfg_star_time_stop_days'),
+      limit_up:          getPct('cfg_star_limit_up'),
+      take_profit:       (_cfgData.star_board||{}).take_profit || 0.15,
+    },
+    general: {
+      max_positions:    getInt('cfg_general_max_positions'),
+      prev_bar_up:      (()=>{ const el=document.getElementById('cfg_general_prev_bar_up'); return el ? (el.checked ? 1 : 0) : ((_cfgData.general||{}).prev_bar_up||0); })(),
+      top_n:            (_cfgData.general||{}).top_n || 50,
+      buy_time:         (_cfgData.general||{}).buy_time || '14:30',
+      initial_capital:  (_cfgData.general||{}).initial_capital || 300000,
+    }
+  };
+  // 简单前端预校验
+  for (const sec of ['main_board', 'star_board']) {
+    for (const [k, v] of Object.entries(payload[sec])) {
+      if (v === null || (typeof v === 'number' && isNaN(v))) {
+        _cfgShowMsg(`参数格式错误: ${sec}.${k}`, 'err'); return;
+      }
+    }
+  }
+  if (!payload.general.max_positions) {
+    _cfgShowMsg('最大持仓数格式错误', 'err'); return;
+  }
+
+  _cfgShowMsg('保存中...', '');
+  const saveBtn = document.getElementById('cfg-save-btn');
+  saveBtn.disabled = true;
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const resp = await r.json();
+    if (resp.ok) {
+      _cfgShowMsg(resp.msg, 'ok');
+      cfgCancel();   // 退出编辑模式
+      loadConfig();  // 重新加载显示最新值
+    } else {
+      _cfgShowMsg(resp.msg || '保存失败', 'err');
+    }
+  } catch(e) {
+    _cfgShowMsg('请求失败: ' + e, 'err');
+  } finally {
+    saveBtn.disabled = false;
+  }
 }
 
 function pctStr(v) {
@@ -774,6 +1296,281 @@ async function procStop(mode) {
 // ==================== 初始化 ====================
 refreshAll();
 startCountdown();
+
+// ==================== 模拟盘专属函数 ====================
+let _equityChart      = null;
+let _simCurrentRunId  = null;
+
+function _showSimEmpty() {
+  document.getElementById('sim-summary-cards').style.display = 'none';
+  document.getElementById('sim-chart-panel').style.display   = 'none';
+  document.getElementById('sim-params-panel').style.display  = 'none';
+  document.getElementById('trade-count').textContent         = '0 条';
+  document.getElementById('trade-tbody').innerHTML           =
+    '<tr class="empty-row"><td colspan="9">暂无模拟交易记录</td></tr>'
+  document.getElementById('sim-del-btn').disabled = true;
+  if (_equityChart) { _equityChart.destroy(); _equityChart = null; }
+}
+
+async function loadSimList() {
+  const list = await fetchJSON('/api/sim/list');
+  const sel   = document.getElementById('sim-run-select');
+  const delBtn = document.getElementById('sim-del-btn');
+  if (!list || !list.length) {
+    sel.innerHTML = '<option value="">— 暂无模拟存档 —</option>';
+    delBtn.disabled = true;
+    _showSimEmpty();
+    return;
+  }
+  const prev = sel.value;
+  sel.innerHTML = list.map(item => {
+    const s   = item.summary || {};
+    const pct = s.profit_pct !== undefined ? s.profit_pct : 0;
+    const sign = pct >= 0 ? '+' : '';
+    const label = `${item.start_date} ~ ${item.end_date}  |  ` +
+                  `${sign}${Number(pct).toFixed(2)}%  |  ` +
+                  `运行: ${item.run_time}`;
+    return `<option value="${item.run_id}">${label}</option>`;
+  }).join('');
+  if (prev && list.some(i => i.run_id === prev)) {
+    sel.value = prev;
+  } else {
+    sel.value = list[0].run_id;
+  }
+  delBtn.disabled = false;
+  loadSimDetail(sel.value);
+}
+
+async function loadSimDetail(runId) {
+  if (!runId) return;
+  _simCurrentRunId = runId;
+  const data = await fetchJSON('/api/sim/' + runId);
+  if (!data || data.error) return;
+
+  document.getElementById('sim-summary-cards').style.display = '';
+  document.getElementById('sim-chart-panel').style.display   = '';
+  document.getElementById('sim-params-panel').style.display  = '';
+  document.getElementById('sim-del-btn').disabled = false;
+
+  // 摘要卡片
+  const s = data.summary || {};
+  const initial = data.initial_capital || 300000;
+  document.getElementById('ss-final').textContent = '¥' + fmt(s.final_value);
+  document.getElementById('ss-init').textContent  = '¥' + fmt(initial);
+
+  const profit = s.profit || 0;
+  const profitEl = document.getElementById('ss-profit');
+  profitEl.textContent = (profit >= 0 ? '+' : '') + '¥' + fmt(profit);
+  profitEl.className   = 'sim-stat-value ' + (profit >= 0 ? 'profit-up' : 'profit-down');
+
+  const pct   = s.profit_pct || 0;
+  const pctEl = document.getElementById('ss-profit-pct');
+  pctEl.textContent = fmtPct(pct);
+  pctEl.className   = pct >= 0 ? 'profit-up' : 'profit-down';
+
+  document.getElementById('ss-winrate').textContent = (s.win_rate || 0).toFixed(1) + '%';
+  document.getElementById('ss-maxdd').textContent   = fmtPct(s.max_drawdown || 0);
+  document.getElementById('ss-trades').textContent  =
+    (s.buy_trades || 0) + '买 / ' + (s.sell_trades || 0) + '卖';
+  document.getElementById('ss-days').textContent    = (s.trading_days || 0) + ' 天';
+
+  const rangeEl = document.getElementById('ss-date-range');
+  if (rangeEl) rangeEl.textContent = `${data.start_date} ~ ${data.end_date}`;
+
+  renderEquityChart(data.equity_curve || [], initial);
+  renderSimParams(data.params || {});
+  renderSimTrades(data.trades || []);
+}
+
+function renderEquityChart(curve, initial) {
+  const canvas = document.getElementById('equity-canvas');
+  if (!canvas) return;
+  if (_equityChart) { _equityChart.destroy(); _equityChart = null; }
+  if (!curve.length) return;
+
+  const labels = curve.map(p => p.date);
+  const values = curve.map(p => p.total_value);
+  const endVal  = values[values.length - 1];
+  const isProfit = endVal >= initial;
+  const lineColor = isProfit ? '#ff4444' : '#00c853';
+  const bgColor   = isProfit ? 'rgba(255,68,68,.07)' : 'rgba(0,200,83,.07)';
+
+  _equityChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: '总资产',
+          data: values,
+          borderColor: lineColor,
+          backgroundColor: bgColor,
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.1,
+          fill: true,
+          order: 1,
+        },
+        {
+          label: '初始资金',
+          data: curve.map(() => initial),
+          borderColor: 'rgba(255,255,255,.18)',
+          borderWidth: 1,
+          borderDash: [5, 4],
+          pointRadius: 0,
+          fill: false,
+          order: 2,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#0d2137',
+          borderColor: '#1a5276',
+          borderWidth: 1,
+          callbacks: {
+            label: (ctx) => {
+              if (ctx.datasetIndex === 1) return null;
+              const val = ctx.raw;
+              const p   = ((val - initial) / initial * 100);
+              return `¥${val.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})}` +
+                     `  (${p >= 0 ? '+' : ''}${p.toFixed(2)}%)`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#888', maxTicksLimit: 10, maxRotation: 0 },
+          grid:  { color: '#0f3460' }
+        },
+        y: {
+          ticks: {
+            color: '#888',
+            callback: v => '¥' + v.toLocaleString('zh-CN',{minimumFractionDigits:0,maximumFractionDigits:0})
+          },
+          grid: { color: '#0f3460' }
+        }
+      }
+    }
+  });
+}
+
+function renderSimParams(params) {
+  const container = document.getElementById('sim-cfg-row');
+  if (!container) return;
+  const m = params.main_board || {};
+  const s = params.star_board || {};
+  const g = params.general   || {};
+  function pct(v) {
+    return (v !== undefined && v !== null) ? (v * 100).toFixed(1) + '%' : '--';
+  }
+  function intv(v, unit) {
+    return (v !== undefined && v !== null) ? v + unit : '--';
+  }
+  const mainRows = [
+    ['买入最低涨幅', pct(m.min_change_pct)],
+    ['防追高上限',   pct(m.max_change_pct)],
+    ['移动止盈激活', pct(m.trailing_activate)],
+    ['移动止盈回撤', pct(m.trailing_stop)],
+    ['硬止损',       pct(m.hard_stop_loss)],
+    ['阴跌止损',      pct(m.soft_stop_loss)],
+    ['时间止损',      intv(m.time_stop_days, ' 天')],
+    ['涨停保护',      pct(m.limit_up)],
+  ];
+  const starRows = [
+    ['买入最低涨幅', pct(s.min_change_pct)],
+    ['防追高上限',   pct(s.max_change_pct)],
+    ['移动止盈激活', pct(s.trailing_activate)],
+    ['移动止盈回撤', pct(s.trailing_stop)],
+    ['硬止损',       pct(s.hard_stop_loss)],
+    ['阴跌止损',      pct(s.soft_stop_loss)],
+    ['时间止损',      intv(s.time_stop_days, ' 天')],
+    ['涨停保护',      pct(s.limit_up)],
+  ];
+  const genRows = [
+    ['最大持仓数',   intv(g.max_positions, ' 只')],
+    ['买入价模式',   g.buy_mode || '--'],
+    ['前柱阳线过滤', g.prev_bar_up ? '开启' : (g.prev_bar_up === 0 ? '关闭' : '--')],
+    ['禁追高30%',   g.no_chase_30 ? '开启' : (g.no_chase_30 === 0 ? '关闭' : '--')],
+    ['选股池大小',   intv(g.top_n, ' 只')],
+    ['初始资金', g.initial_capital
+      ? '¥' + Number(g.initial_capital).toLocaleString('zh-CN') : '--'],
+  ];
+  function mkTable(title, rows) {
+    const trs = rows.map(([k, v]) =>
+      `<tr><td>${k}</td><td style="color:#e0e0e0">${v}</td></tr>`
+    ).join('');
+    return `<div class="sim-cfg-block"><table><thead><tr><th colspan="2">${title}</th></tr></thead>` +
+           `<tbody>${trs}</tbody></table></div>`;
+  }
+  container.innerHTML =
+    mkTable('主板 (60/00)', mainRows) +
+    mkTable('科创/创业板 (688/30)', starRows) +
+    mkTable('通用参数', genRows);
+}
+
+function renderSimTrades(trades) {
+  const tbody   = document.getElementById('trade-tbody');
+  const countEl = document.getElementById('trade-count');
+  if (!trades || !trades.length) {
+    countEl.textContent = '0 条';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="10">暂无交易记录</td></tr>';
+    return;
+  }
+  const sorted = [...trades].sort((a, b) => {
+    const ta = a.time || a.timestamp || a.date || '';
+    const tb = b.time || b.timestamp || b.date || '';
+    return tb.localeCompare(ta);
+  });
+  countEl.textContent = sorted.length + ' 条';
+  tbody.innerHTML = sorted.map((t, i) => {
+    const action = t.action || t.direction || t.type || '';
+    const isBuy  = action === 'buy';
+    const dirLabel = isBuy
+      ? '<span class="dir-buy">买入</span>'
+      : '<span class="dir-sell">卖出</span>';
+    const code   = t.code || t.stock_code || '';
+    const price  = t.price || 0;
+    const qty    = t.quantity || t.volume || 0;
+    const amount = t.amount || (price * qty);
+    const reason = t.reason || t.sell_reason || '';
+    const time   = t.time || t.timestamp || t.date || '';
+    return `<tr>
+      <td class="row-num">${i+1}</td>
+      <td>${time}</td>
+      <td><b>${code}</b></td>
+      <td>${dirLabel}</td>
+      <td>${fmt(price)}</td>
+      <td>${qty.toLocaleString()}</td>
+      <td>¥${fmt(amount)}</td>
+      <td>${reasonTag(reason)}</td>
+      <td>${!isBuy && t.pnl != null ? pnlCell(t.pnl, t.pnl_pct) : '--'}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function deleteSimResult() {
+  if (!_simCurrentRunId) return;
+  if (!confirm('确认删除这次模拟结果？此操作不可恢复。')) return;
+  try {
+    const r = await fetch('/api/sim/' + _simCurrentRunId, { method: 'DELETE' });
+    const data = await r.json();
+    if (data.ok) {
+      _simCurrentRunId = null;
+      _showSimEmpty();
+      loadSimList();
+    } else {
+      alert('删除失败: ' + (data.msg || ''));
+    }
+  } catch(e) {
+    alert('请求失败: ' + e);
+  }
+}
 </script>
 </body>
 </html>

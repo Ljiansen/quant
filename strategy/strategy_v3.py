@@ -57,6 +57,9 @@ class StrategyV3:
         self.star_soft_stop_loss = p.get('star_soft_stop_loss', config.V3_STAR_SOFT_STOP_LOSS)
         self.star_time_stop_days = p.get('star_time_stop_days', config.V3_STAR_TIME_STOP_DAYS)
         self.star_limit_up = p.get('star_limit_up', config.V3_STAR_LIMIT_UP)
+        # 防追高过滤参数
+        self.max_change_pct = p.get('max_change_pct', config.V3_MAX_CHANGE_PCT)
+        self.star_max_change_pct = p.get('star_max_change_pct', config.V3_STAR_MAX_CHANGE_PCT)
         # 移动止盈参数
         self.trailing_activate = p.get('trailing_activate', config.V3_TRAILING_ACTIVATE)
         self.trailing_stop = p.get('trailing_stop', config.V3_TRAILING_STOP)
@@ -305,9 +308,10 @@ class StrategyV3:
 
         买入条件（全部满足）:
             1. 涨幅 > 阈值（科创板/创业板>2%，主板>1%）
-               涨幅 = (close - pre_close) / pre_close（当天数据，近似尾盘扫描）
-            2. 收阳线: close > open
-            3. 未涨停:
+               涨幅 = (close - pre_close) / pre_close（当天收盘数据，近似尾盘扫描）
+            2. 涨幅 < 防追高阈值（科创/创业板<8%，主板<5%）
+            3. 收阳线: close > open
+            4. 未涨停:
                - 科创板/创业板(688/30开头): 涨幅 < 19.8%
                - 主板(60/00开头): 涨幅 < 9.8%
 
@@ -326,16 +330,22 @@ class StrategyV3:
         open_price = bar.get('open', 0)
 
         # 1. 涨幅判断（当天数据）
-        change_pct = (close - pre_close) / pre_close
+        change_pct = round((close - pre_close) / pre_close, 6)  # 保留6位避免浮点误差
 
         # 根据板块使用不同涨幅阈值
         if self._is_star(code):
             # 科创板/创业板：涨幅 > 2%
             if change_pct <= self.star_min_change_pct:
                 return False
+            # 防追高：涨幅不超过上限
+            if change_pct >= self.star_max_change_pct:
+                return False
         else:
             # 主板：涨幅 > 1%
             if change_pct <= self.min_change_pct:
+                return False
+            # 防追高：涨幅不超过上限
+            if change_pct >= self.max_change_pct:
                 return False
 
         # 2. 收阳线: close > open

@@ -69,17 +69,21 @@ def query_and_print_order(trader, account, order_id):
     return None
 
 
+# 测试专用 session ID，避免与实盘进程冲突（实盘用 654321）
+_TEST_SESSION_ID = 654399
+
+
 def test_order():
     """测试下单流程"""
     print("=" * 60)
     print("miniQMT 下单测试开始")
     print("=" * 60)
 
-    # 1. 创建交易接口实例
+    # 1. 创建交易接口实例（使用测试专用 session，不占用实盘 session）
     print(f"\n[1/6] 正在创建 XtQuantTrader 实例...")
     print(f"      miniQMT 路径: {config.MINIQMT_PATH}")
-    print(f"      Session ID: {config.SESSION_ID}")
-    trader = XtQuantTrader(config.MINIQMT_PATH, config.SESSION_ID)
+    print(f"      Session ID: {_TEST_SESSION_ID}（测试专用，不影响实盘）")
+    trader = XtQuantTrader(config.MINIQMT_PATH, _TEST_SESSION_ID)
 
     # 2. 注册回调
     print("\n[2/6] 正在注册回调...")
