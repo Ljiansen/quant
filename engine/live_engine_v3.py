@@ -365,17 +365,19 @@ class LiveEngineV3:
                         # 检查持仓止损/止盈
                         self._monitor_positions()
 
-                        # 持仓不足3只，扫描买入
-                        # 持仓不足，扫描买入（每分钟扫描一次，快速捕捉信号）
+                        # 持仓不足，扫描买入（9:35起，跳过开盘首根K线，每分钟扫描一次）
                         if self._count_effective_positions() < self.max_positions:
-                            _scan_interval_secs = 1 * 60
-                            _should_scan = (
-                                self._last_buy_scan_time is None or
-                                (datetime.now() - self._last_buy_scan_time).total_seconds() >= _scan_interval_secs
-                            )
-                            if _should_scan:
-                                self._last_buy_scan_time = datetime.now()
-                                self._scan_and_buy()
+                            # 9:30~9:34 跳过买入扫描：等待第一根5分钟K线（9:30-9:35）收盘
+                            _buy_scan_allowed = (h == 9 and m >= 35) or (10 <= h <= 14) or (h == 15 and m == 0)
+                            if _buy_scan_allowed:
+                                _scan_interval_secs = 1 * 60
+                                _should_scan = (
+                                    self._last_buy_scan_time is None or
+                                    (datetime.now() - self._last_buy_scan_time).total_seconds() >= _scan_interval_secs
+                                )
+                                if _should_scan:
+                                    self._last_buy_scan_time = datetime.now()
+                                    self._scan_and_buy()
 
                         # 14:55 收盘前检查阴跌/时间止损
                         if h == 14 and m >= 55 and not self._close_check_done:
@@ -1075,16 +1077,16 @@ class LiveEngineV3:
             if last_price <= 0 or pre_close <= 0 or volume == 0:
                 continue
 
-            # 排除ST股票
-            try:
-                from xtquant import xtdata
-                detail = xtdata.get_instrument_detail(symbol)
-                if detail:
-                    name = detail.get('InstrumentName', '')
-                    if 'ST' in name:
-                        continue
-            except Exception:
-                pass
+            # 排除ST股票（暂时注释：建池阶段未过滤，此处保留逻辑但不执行）
+            # try:
+            #     from xtquant import xtdata
+            #     detail = xtdata.get_instrument_detail(symbol)
+            #     if detail:
+            #         name = detail.get('InstrumentName', '')
+            #         if 'ST' in name:
+            #             continue
+            # except Exception:
+            #     pass
 
             # 检查买入信号
             bar = {
@@ -1704,7 +1706,7 @@ class LiveEngineV3:
 
         过滤：
         1. 排除已持仓股票
-        2. 排除日均成交额 < 5亿 的股票（每天缓存一次）
+        2. （暂时停用）排除日均成交额 < 5亿 的股票
         """
         if not self.rebalance_pool:
             return []
@@ -1714,14 +1716,15 @@ class LiveEngineV3:
         if not candidates:
             return []
 
-        # 日均成交额过滤（每天缓存一次）
-        today_str = date.today().strftime('%Y-%m-%d')
-        if self._daily_filter_date != today_str or not self._daily_filter_cache:
-            self._daily_filter_cache = self._filter_by_avg_amount(candidates)
-            self._daily_filter_date = today_str
-            self._save_state()
+        # 日均成交额过滤（暂时注释：建池阶段未过滤，盘中二次过滤暂停用）
+        # today_str = date.today().strftime('%Y-%m-%d')
+        # if self._daily_filter_date != today_str or not self._daily_filter_cache:
+        #     self._daily_filter_cache = self._filter_by_avg_amount(candidates)
+        #     self._daily_filter_date = today_str
+        #     self._save_state()
+        # return [c for c in candidates if c in self._daily_filter_cache]
 
-        return [c for c in candidates if c in self._daily_filter_cache]
+        return candidates
 
     def _filter_by_avg_amount(self, candidates: list) -> list:
         """过滤日均成交额 >= 5亿 的股票，返回合格代码列表

@@ -92,14 +92,14 @@ Write-Step 1 "启动 Dashboard"
 Write-Info "启动 run_dashboard.py..."
 Start-Process python -ArgumentList "run_dashboard.py" -WorkingDirectory $ProjectDir -WindowStyle Hidden
 
-Write-Info "等待 Dashboard 就绪（最多 15 秒）..."
+Write-Info "等待 Dashboard 就绪（最多 20 秒）..."
 $ready = $false
-for ($i = 0; $i -lt 15; $i++) {
+for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep 1
-    try {
-        Invoke-WebRequest -Uri "http://localhost:$DashPort" -TimeoutSec 1 -UseBasicParsing -ErrorAction Stop | Out-Null
-        $ready = $true; break
-    } catch {}
+    # 用 TCP 端口检测，避免 HTTP 首次响应慢导致误判
+    $tcp = Test-NetConnection -ComputerName localhost -Port $DashPort `
+           -InformationLevel Quiet -WarningAction SilentlyContinue 2>$null
+    if ($tcp) { $ready = $true; break }
 }
 if ($ready) { Write-OK "Dashboard 已就绪 → http://localhost:$DashPort" }
 else        { Write-Err "Dashboard 启动超时，继续下一步..." }
@@ -181,20 +181,26 @@ if ($qmtProc) {
 
 # 检测 xtquant 连接
 Write-Info "检测 xtquant 服务连接..."
+$XtResultFile = "$env:TEMP\xt_check_result.txt"
 @"
 try:
     import xtquant.xtdata as d
     r = d.connect()
-    print('ok' if r == 0 else 'fail')
+    # connect() 成功返回 IPythonApiClient 对象（非 None），失败返回 None 或抛异常
+    status = 'ok' if r is not None else 'fail:None'
 except Exception as e:
-    print('fail')
+    status = f'fail:{type(e).__name__}'
+open(r'$XtResultFile', 'w').write(status)
 "@ | Set-Content $XtCheckScript -Encoding UTF8
 
 $xtReady  = $false
 $deadline = [DateTime]::Now.AddSeconds(60)
 while ([DateTime]::Now -lt $deadline) {
-    $r = python $XtCheckScript 2>$null
-    if ($r -eq 'ok') { $xtReady = $true; break }
+    # 将结果写入文件，完全规避 xtdata 向 stdout 打印日志导致的解析问题
+    if (Test-Path $XtResultFile) { Remove-Item $XtResultFile -Force }
+    python $XtCheckScript *>$null
+    $result = (Get-Content $XtResultFile -ErrorAction SilentlyContinue -Raw) -replace '\s',''
+    if ($result -eq 'ok') { $xtReady = $true; break }
     Write-Host -NoNewline "." -ForegroundColor DarkGray
     Start-Sleep 2
 }

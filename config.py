@@ -44,12 +44,11 @@ LOG_LEVEL = 'INFO'
 # ===== V3策略参数 =====
 V3_TOP_N = 50                    # 选股池大小（综合排名前N）
 V3_MAX_POSITIONS = 3             # 最大持仓数
-V3_BUY_TIME = '14:30'           # 买入时间
 V3_MIN_CHANGE_PCT = 0.01        # 主板/创业板最低涨幅1%
 V3_HARD_STOP_LOSS = 0.03        # 硬止损3%（网格优化最优参数）
 V3_SOFT_STOP_LOSS = 0.02        # 阴跌止损2%（网格优化最优参数）
 V3_TAKE_PROFIT = 0.05           # 主板/创业板固定止盈5%（保留兼容，已被移动止盈替代）
-V3_TRAILING_ACTIVATE = 0.02     # 主板/创业板：浮盈超2%后激活移动止盈（网格优化最优参数）
+V3_TRAILING_ACTIVATE = 0.005    # 主板/创业板：浮盈超0.5%后激活移动止盈（多周期验证最优参数）
 V3_TRAILING_STOP = 0.01         # 主板/创业板：从最高价回撤1%触发卖出（网格优化最优参数）
 V3_TIME_STOP_DAYS = 5           # 时间止损天数
 V3_COMMISSION_RATE = 0.00025    # 佣金0.025%
@@ -59,8 +58,7 @@ V3_INITIAL_CAPITAL = 300000     # 初始资金
 V3_DATA_SOURCE = 'local'        # V3数据源: 'akshare' / 'baostock' / 'local'
 V3_LOCAL_DATA_DIR = 'D:/daily_data'  # 本地数据目录
 
-# 半年调仓参数
-V3_REBALANCE_MONTHS = [1, 7]    # 调仓月份（1月和7月）
+# 调仓参数
 V3_REBALANCE_LOOKBACK = 120     # 回看交易日数（约6个月）
 
 # 每日二次过滤参数
@@ -71,7 +69,7 @@ V3_DAILY_AMOUNT_DAYS = 10       # 日均成交额回看天数
 V3_STAR_MIN_CHANGE_PCT = 0.02   # 科创板买入最低涨幅2%
 V3_STAR_TAKE_PROFIT = 0.15      # 科创板止盈15%（保留兼容，已被移动止盈替代）
 V3_STAR_TRAILING_ACTIVATE = 0.08  # 科创板：浮盈超8%后激活移动止盈
-V3_STAR_TRAILING_STOP = 0.05    # 科创板：从最高价回撤5%触发卖出
+V3_STAR_TRAILING_STOP = 0.05    # 科创板：从最高价回撤5%触发卖出（网格优化最优参数）
 V3_STAR_HARD_STOP_LOSS = 0.03   # 科创板硬止损3%（网格优化最优参数）
 V3_STAR_SOFT_STOP_LOSS = 0.02   # 科创板阴跌止损2%（网格优化最优参数）
 V3_STAR_TIME_STOP_DAYS = 5      # 科创板时间止损5天
