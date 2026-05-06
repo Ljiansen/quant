@@ -389,6 +389,32 @@ class TradeExecutor:
             print(f"[{_now_str()}] [TradeExecutor] 查询订单异常: {e}")
             return []
 
+    def query_trades(self) -> list:
+        """查询当日成交明细（含实际成交价）
+
+        Returns:
+            list[dict]，每个元素包含:
+                order_id, symbol, traded_volume, traded_price
+        """
+        if not self._check_ready():
+            return []
+        try:
+            trades = self._trader.query_stock_trades(self._account)
+            if trades is None:
+                return []
+            result = []
+            for t in trades:
+                result.append({
+                    "order_id":      getattr(t, "order_id",      -1),
+                    "symbol":        getattr(t, "stock_code",    ""),
+                    "traded_volume": getattr(t, "traded_volume", 0),
+                    "traded_price":  getattr(t, "traded_price",  0.0),
+                })
+            return result
+        except Exception as e:
+            print(f"[{_now_str()}] [TradeExecutor] 查询成交明细异常: {e}")
+            return []
+
     # ------------------------------------------------------------------
     # 条件单（服务器端止损兜底）
     # ------------------------------------------------------------------

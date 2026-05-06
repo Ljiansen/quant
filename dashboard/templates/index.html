@@ -330,13 +330,13 @@ tr:hover td { background: rgba(233,69,96,.08); }
     <div class="panel">
       <div class="panel-header" style="flex-wrap:wrap;gap:8px;">
         <div style="display:flex;align-items:center;gap:8px;">
-          <span class="panel-title">候选买入</span>
+          <span class="panel-title">候选买入 <span style="font-size:11px;font-weight:400;color:#7aabcc;">(次日)</span></span>
           <div class="info-icon" id="pool-info-icon" onmouseenter="_posTooltip(this)" onmouseleave="_hideTooltip(this)">?<div class="tooltip-box" id="pool-tooltip-box">
               <span class="tooltip-title">&#x1F4CB; 每日选股逻辑（B+A策略）</span>
               <div class="tooltip-step"><b>① 趋势过滤（B）</b>：收盘价 &gt; MA20（20日均线），确保股票处于上升趋势，排除弱势股</div>
               <div class="tooltip-step"><b>② 信号质量评分（A）</b>：统计近60个交易日内，日涨幅在 1%~7% 且当日收阳（收盘&gt;开盘）的天数，天数越多说明上涨信号越稳定</div>
               <div class="tooltip-step"><b>③ 取 Top 50</b>：按评分排名取前 50 只，作为次日候选买入池</div>
-              <div style="margin-top:8px;color:#7aabcc;font-size:11px;">&#x23F0; 每天收盘后自动刷新，次日开盘监控 5 分钟线买入信号</div>
+              <div style="margin-top:8px;color:#7aabcc;font-size:11px;">&#x23F0; 每天收盘后重建，始终显示<b>次日生效</b>的候选池（最新 state_v3_rebalance.json）</div>
             </div></div>
         </div>
         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
@@ -532,7 +532,7 @@ function fmt(n, dec=2) {
 function fmtPct(n) {
   if (n === null || n === undefined || n === '') return '--';
   const v = Number(n);
-  return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+  return (v >= 0 ? '+' : '') + v.toFixed(3) + '%';
 }
 
 function boardTag(code) {
@@ -564,8 +564,8 @@ function pnlCell(pnl, pnlPct) {
   const isPos = pnl >= 0;
   const color = isPos ? '#ff4444' : '#00c853';
   const sign  = isPos ? '+' : '';
-  const pct   = pnlPct != null ? ` (${sign}${Number(pnlPct).toFixed(2)}%)` : '';
-  return `<span style="color:${color};font-weight:600">${sign}¥${fmt(Math.abs(pnl))}${pct}</span>`;
+  const pct   = pnlPct != null ? ` (${sign}${Number(pnlPct).toFixed(3)}%)` : '';
+  return `<span style="color:${color};font-weight:600">${sign}¥${fmt(Math.abs(pnl), 3)}${pct}</span>`;
 }
 
 function reasonTag(r) {
@@ -647,8 +647,8 @@ async function loadPoolStatus() {
   });
   const msgEl = document.getElementById('pool-strategy-msg');
   if (msgEl) {
-    if (data.last_rebuild) msgEl.textContent = '更新 ' + data.last_rebuild;
-    else if (data.rebalance_date) msgEl.textContent = '调仓日 ' + data.rebalance_date;
+    if (data.last_rebuild) msgEl.textContent = '建池于 ' + data.last_rebuild + ' · 次日生效';
+    else if (data.rebalance_date) msgEl.textContent = '建池于 ' + data.rebalance_date + ' · 次日生效';
   }
   if (data.rebuilding) {
     _showRebuildBar(data.last_msg || '选股进行中...');
@@ -752,16 +752,16 @@ async function loadStatus() {
   const data = await fetchJSON('/api/status?mode=' + currentMode);
   if (!data) return;
 
-  document.getElementById('c-total').textContent = '¥' + fmt(data.total_value);
-  document.getElementById('c-cash').textContent  = '¥' + fmt(data.cash);
-  document.getElementById('c-init').textContent  = '¥' + fmt(data.initial_capital);
+  document.getElementById('c-total').textContent = '¥' + fmt(data.total_value, 3);
+  document.getElementById('c-cash').textContent  = '¥' + fmt(data.cash, 3);
+  document.getElementById('c-init').textContent  = '¥' + fmt(data.initial_capital, 3);
 
   const posVal = (data.total_value || 0) - (data.cash || 0);
-  document.getElementById('c-pos-val').textContent = '¥' + fmt(posVal);
+  document.getElementById('c-pos-val').textContent = '¥' + fmt(posVal, 3);
 
   const profitEl = document.getElementById('c-profit');
   const profitPctEl = document.getElementById('c-profit-pct');
-  profitEl.textContent = (data.profit >= 0 ? '+' : '') + '¥' + fmt(data.profit);
+  profitEl.textContent = (data.profit >= 0 ? '+' : '') + '¥' + fmt(data.profit, 3);
   profitEl.className = 'card-value ' + (data.profit >= 0 ? 'profit-up' : 'profit-down');
   profitPctEl.textContent = fmtPct(data.profit_pct);
   profitPctEl.className = data.profit >= 0 ? 'profit-up' : 'profit-down';
@@ -797,7 +797,10 @@ function renderPositions(positions, statusData) {
     const days = p.days_held || p.hold_days || p.days || 0;
     const star = isStar(code);
     const isKC  = String(code).replace(/\.\w+$/, '').startsWith('688'); // 科创板
-    const stopLoss  = buyPrice * (1 - 0.05);
+    const hardSl = configData
+      ? (isKC ? (configData.star_board.hard_stop_loss || 0.05) : (configData.main_board.hard_stop_loss || 0.03))
+      : (isKC ? 0.05 : 0.03);
+    const stopLoss  = buyPrice * (1 - hardSl);
     // 使用全局 configData（若尚未加载则用默认值）
     const trailAct = configData
       ? (isKC ? (configData.star_board.trailing_activate || 0.08) : (configData.main_board.trailing_activate || 0.03))
@@ -810,10 +813,10 @@ function renderPositions(positions, statusData) {
     let trailCell;
     if (highestPrice >= activateThreshold) {
       const triggerPrice = highestPrice * (1 - trailPct);
-      trailCell = `<span class="profit-up">${fmt(triggerPrice)}</span>`
-        + `<small class="trail-active">↑最高${fmt(highestPrice)} 追踪中</small>`;
+      trailCell = `<span class="profit-up">${fmt(triggerPrice, 3)}</span>`
+        + `<small class="trail-active">↑最高${fmt(highestPrice, 3)} 追踪中</small>`;
     } else {
-      trailCell = `<span style="color:#888">${fmt(activateThreshold)}</span>`
+      trailCell = `<span style="color:#888">${fmt(activateThreshold, 3)}</span>`
         + `<small class="trail-inactive">待激活 浮盈超${(trailAct*100).toFixed(0)}%开始追踪</small>`;
     }
     const status = p.status || '持仓中';
@@ -822,7 +825,7 @@ function renderPositions(positions, statusData) {
     if (curPrice && buyPrice) {
       const pnlPct = (curPrice - buyPrice) / buyPrice * 100;
       const pnlCls = pnlPct >= 0 ? 'profit-up' : 'profit-down';
-      pnlHtml = `<span class="${pnlCls}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%</span>`;
+      pnlHtml = `<span class="${pnlCls}">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}%</span>`;
     } else {
       pnlHtml = '<span style="color:#555">--</span>';
     }
@@ -831,13 +834,13 @@ function renderPositions(positions, statusData) {
       <td class="row-num">${i+1}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${boardTag(code)}</td>
-      <td>${fmt(buyPrice)}</td>
-      <td>${curPrice ? fmt(curPrice) : '<span style="color:#555">--</span>'}</td>
+      <td>${fmt(buyPrice, 3)}</td>
+      <td>${curPrice ? fmt(curPrice, 3) : '<span style="color:#555">--</span>'}</td>
       <td>${qtyHtml}</td>
       <td>¥${fmt(mktVal)}</td>
       <td>${pnlHtml}</td>
       <td>${days} 天</td>
-      <td>${fmt(stopLoss)}</td>
+      <td>${fmt(stopLoss, 3)}</td>
       <td>${trailCell}</td>
       <td>${status}</td>
     </tr>`;
@@ -870,7 +873,7 @@ function renderPendingSells(pendingSells, positions) {
       <td class="row-num">${i+1}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${reasonTag(reason)}</td>
-      <td>${buyPrice !== '--' ? fmt(buyPrice) : '--'}</td>
+      <td>${buyPrice !== '--' ? fmt(buyPrice, 3) : '--'}</td>
       <td>${days}${days !== '--' ? ' 天' : ''}</td>
       <td>次日集合竞价</td>
     </tr>`;
@@ -908,7 +911,7 @@ async function loadTrades() {
       <td>${time}</td>
       <td><b>${code}</b>${nameHtml}</td>
       <td>${dirLabel}</td>
-      <td>${fmt(price)}</td>
+      <td>${fmt(price, 3)}</td>
       <td>${qty.toLocaleString()}</td>
       <td>¥${fmt(amount)}</td>
       <td>${reasonTag(reason)}</td>
@@ -935,7 +938,7 @@ async function loadCandidates() {
     const pctStr = pct !== null && pct !== undefined
       ? '<span class="' + (pct >= 0 ? 'chg-up' : 'chg-dn') + '">' + (pct >= 0 ? '+' : '') + Number(pct).toFixed(2) + '%</span>'
       : '<span class="chg-na">--</span>';
-    const priceStr = c.last_price !== null && c.last_price !== undefined ? Number(c.last_price).toFixed(2) : '--';
+    const priceStr = c.last_price !== null && c.last_price !== undefined ? Number(c.last_price).toFixed(3) : '--';
     const yangStr  = c.is_positive === null || c.is_positive === undefined ? '--' : (c.is_positive ? '✅' : '❌');
     const threshStr = (c.buy_threshold !== null && c.buy_threshold !== undefined) ? '>' + c.buy_threshold + '%' : '--';
     let statusCls = 'status-none', statusText = c.status || '无行情';
@@ -996,7 +999,7 @@ async function loadNewStocks() {
     const pctStr   = (pct !== null && pct !== undefined)
       ? `<span class="${pct >= 0 ? 'chg-up' : 'chg-dn'}">${pct >= 0 ? '+' : ''}${Number(pct).toFixed(2)}%</span>`
       : '<span class="chg-na">--</span>';
-    const priceStr = (price !== null && price !== undefined) ? Number(price).toFixed(2) : '--';
+    const priceStr = (price !== null && price !== undefined) ? Number(price).toFixed(3) : '--';
     // 计算上市天数
     let daysHtml = '';
     if (s.open_date && s.open_date !== '--') {
@@ -1294,7 +1297,8 @@ async function procStop(mode) {
 }
 
 // ==================== 初始化 ====================
-refreshAll();
+// 用 switchMode 初始化，确保标签/区块显示与 currentMode 保持一致
+switchMode(currentMode);
 startCountdown();
 
 // ==================== 模拟盘专属函数 ====================
@@ -1545,7 +1549,7 @@ function renderSimTrades(trades) {
       <td>${time}</td>
       <td><b>${code}</b></td>
       <td>${dirLabel}</td>
-      <td>${fmt(price)}</td>
+      <td>${fmt(price, 3)}</td>
       <td>${qty.toLocaleString()}</td>
       <td>¥${fmt(amount)}</td>
       <td>${reasonTag(reason)}</td>

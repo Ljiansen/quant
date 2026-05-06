@@ -3171,7 +3171,1577 @@ def run_all():
     except BaseException:
         pass
     
-    print("[覆盖率检查] 全部完成！")
+    # ── HC-28 _load_rebalance_pool 预缓存诊断：_without_cache 警告 + 异常分支 ──────
+    try:
+        import tempfile as _tf28, os as _os28, json as _j28
+        from unittest.mock import patch as _p28
+
+        # 1) _without_cache 非空 → 触发警告分支
+        _tmp28 = _tf28.NamedTemporaryFile(
+            mode='w', suffix='.json', delete=False, encoding='utf-8')
+        _j28.dump({'pool': ['GHOST001'], 'rebalance_date': '2020-01-01'}, _tmp28,
+                  ensure_ascii=False)
+        _tmp28.close()
+        _orig_rf28 = eng.REBALANCE_FILE
+        eng.REBALANCE_FILE = _tmp28.name
+        import config as _cfg28
+        _orig_dir28 = getattr(_cfg28, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
+        _cfg28.V3_NEXT_POOL_5MIN_DIR = 'd:/no_such_5min_dir_hc28'
+        eng._load_rebalance_pool()   # 触发 _without_cache 警告
+        _cfg28.V3_NEXT_POOL_5MIN_DIR = _orig_dir28
+
+        # 2) glob.glob 抛异常 → 触发诊断 except 分支
+        with _p28('glob.glob', side_effect=RuntimeError('mock glob hc28')):
+            eng._load_rebalance_pool()
+
+        eng.REBALANCE_FILE = _orig_rf28
+        _os28.unlink(_tmp28.name)
+        print('[HC-28] _load_rebalance_pool diagnostic branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-29 _check_close_signals 所有分支 ───────────────────────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV29
+        from unittest.mock import patch as _p29
+
+        def _mk29(pos_list, pending=None):
+            _e = _LV29.__new__(_LV29)
+            _e.ENGINE_NAME = 'HC29'; _e.mode = 'simulation'
+            _e.positions  = [dict(p) for p in pos_list]
+            _e.pending_sells = list(pending or [])
+            _e._condition_orders = {}
+            _e.soft_stop_loss = 0.02;  _e.star_soft_stop_loss = 0.03
+            _e.trailing_activate = 0.02; _e.star_trailing_activate = 0.08
+            _e.trailing_stop = 0.01;     _e.star_trailing_stop   = 0.05
+            _e.time_stop_days = 5;       _e.star_time_stop_days  = 5
+            return _e
+
+        _p29_base = {'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                     'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.0}
+
+        # A: soft_stop — last=9.7 < buy*(1-0.02)=9.8 AND last < open=9.9
+        _e29a = _mk29([_p29_base])
+        with _p29.object(_LV29, '_get_position_5m_bars',
+                         return_value={'000001': {'close': 9.7, 'open': 9.9, 'high': 9.95, 'low': 9.6, 'volume': 1000}}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.7, 'open': 9.9, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_cancel_condition_order_for_code'), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._NOTIFIER_OK', False), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV29._check_close_signals(_e29a)
+        assert len(_e29a.pending_sells) == 1 and _e29a.pending_sells[0].get('sell_type') == 'soft_stop'
+
+        # B: trailing_stop — highest=10.3>=buy*1.02, last=10.18<=10.3*0.99=10.197
+        _e29b = _mk29([{**_p29_base, 'highest_price': 10.3}])
+        with _p29.object(_LV29, '_get_position_5m_bars',
+                         return_value={'000001': {'close': 10.18, 'open': 10.0, 'high': 10.2, 'low': 10.1, 'volume': 1000}}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 10.18, 'open': 10.0, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_cancel_condition_order_for_code'), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._NOTIFIER_OK', False), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV29._check_close_signals(_e29b)
+        assert any(p.get('sell_type') == 'trailing_stop' for p in _e29b.pending_sells)
+
+        # C: time_stop — days_held=6>=5, last=9.9<=buy=10.0
+        _e29c = _mk29([{**_p29_base, 'days_held': 6}])
+        with _p29.object(_LV29, '_get_position_5m_bars',
+                         return_value={'000001': {'close': 9.9, 'open': 9.95, 'high': 10.0, 'low': 9.8, 'volume': 1000}}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.9, 'open': 9.95, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_cancel_condition_order_for_code'), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._NOTIFIER_OK', False), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=6):
+            _LV29._check_close_signals(_e29c)
+        assert any(p.get('sell_type') == 'time_stop' for p in _e29c.pending_sells)
+
+        # D: days_held=0 → T+1 skip
+        _e29d = _mk29([{**_p29_base, 'days_held': 0}])
+        with _p29.object(_LV29, '_get_position_5m_bars',
+                         return_value={'000001': {'close': 9.7, 'open': 9.9, 'high': 9.95, 'low': 9.6, 'volume': 1000}}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.7, 'open': 9.9, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=0):
+            _LV29._check_close_signals(_e29d)
+        assert len(_e29d.pending_sells) == 0
+
+        # E: already in pending_sells → not added again (L1532-1536)
+        _e29e = _mk29([_p29_base], pending=[{'code': '000001', 'sell_type': 'soft_stop'}])
+        with _p29.object(_LV29, '_get_position_5m_bars',
+                         return_value={'000001': {'close': 9.7, 'open': 9.9, 'high': 9.95, 'low': 9.6, 'volume': 1000}}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.7, 'open': 9.9, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._NOTIFIER_OK', False), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV29._check_close_signals(_e29e)
+        assert len(_e29e.pending_sells) == 1  # not added again
+
+        # F: empty positions → early return
+        _e29f = _mk29([])
+        with _p29.object(_LV29, '_get_position_5m_bars', return_value={}), \
+             _p29.object(_LV29, '_get_full_tick', return_value={}), \
+             _p29.object(_LV29, '_save_state'):
+            _LV29._check_close_signals(_e29f)
+
+        # G: no bar, use tick fallback (L1484-1485)
+        _e29g = _mk29([_p29_base])
+        with _p29.object(_LV29, '_get_position_5m_bars', return_value={}), \
+             _p29.object(_LV29, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.7, 'open': 9.9, 'lastClose': 10.0}}), \
+             _p29.object(_LV29, '_cancel_condition_order_for_code'), \
+             _p29.object(_LV29, '_save_state'), \
+             _p29('engine.live_engine_v3._NOTIFIER_OK', False), \
+             _p29('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV29._check_close_signals(_e29g)
+
+        print('[HC-29] _check_close_signals all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-30 _execute_sell_with_fallback 三段式 ───────────────────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV30
+        from unittest.mock import patch as _p30
+
+        def _mk30(positions=None):
+            _e = _LV30.__new__(_LV30)
+            _e.ENGINE_NAME = 'HC30'; _e.mode = 'live'
+            _e.positions     = list(positions or [])
+            _e.pending_sells = []
+            _e.cash          = 100000.0
+            _e.commission_rate = 0.00025; _e.min_commission = 5.0
+            _e.stamp_tax_rate  = 0.001
+            _e.TRADES_LOG_FILE       = 'trades_v3.json'
+            _e.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+            _e.STATE_FILE    = 'd:/nonexistent_hc30/s.json'
+            _e._condition_orders = {}
+            return _e
+
+        _pos30 = {'code': '000001', 'buy_price': 10.0, 'quantity': 200,
+                  'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.5}
+        # tick: bid=9.7 >= sell_price=9.7 → 路由L1791 (无折价)
+        _tick30 = {'000001.SZ': {'lastPrice': 9.7, 'bidPrice': [9.7], 'lastClose': 10.0}}
+
+        # A: Round1 全量成交
+        _e30a = _mk30(positions=[dict(_pos30)])
+        _r1_ok = {'status': 'filled', 'filled_qty': 200, 'fill_price': 9.7}
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30), \
+             _p30.object(_LV30, '_place_sell_order', return_value=99991), \
+             _p30.object(_LV30, '_wait_fill_result', return_value=_r1_ok), \
+             _p30.object(_LV30, '_record_sell_fill'), \
+             _p30.object(_LV30, '_cancel_order'):
+            _LV30._execute_sell_with_fallback(
+                _e30a, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+
+        # B: Round1 未成交→Round2 全量成交 (tick bid=9.68 < sell=9.7, slip small→L1795)
+        _tick30b = {'000001.SZ': {'lastPrice': 9.7, 'bidPrice': [9.698], 'lastClose': 10.0}}
+        _e30b = _mk30(positions=[dict(_pos30)])
+        _r_empty = {'status': 'timeout', 'filled_qty': 0, 'fill_price': 9.7}
+        _r2_ok   = {'status': 'filled',  'filled_qty': 200, 'fill_price': 9.698}
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30b), \
+             _p30.object(_LV30, '_place_sell_order', return_value=99992), \
+             _p30.object(_LV30, '_wait_fill_result', side_effect=[_r_empty, _r2_ok]), \
+             _p30.object(_LV30, '_record_sell_fill'), \
+             _p30.object(_LV30, '_cancel_order'):
+            _LV30._execute_sell_with_fallback(
+                _e30b, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+
+        # C: Round1+Round2 均未成交 → pending_sells (L1855-1875)
+        # bid=9.0 < sell=9.7, slip=(9.7-9.0)/9.7≈0.072>0.003 → L1799-1803 (超阈值WARN)
+        _tick30c = {'000001.SZ': {'lastPrice': 9.0, 'bidPrice': [9.0], 'lastClose': 10.0}}
+        _e30c = _mk30(positions=[dict(_pos30)])
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30c), \
+             _p30.object(_LV30, '_place_sell_order', return_value=99993), \
+             _p30.object(_LV30, '_wait_fill_result', return_value=_r_empty), \
+             _p30.object(_LV30, '_cancel_order'), \
+             _p30.object(_LV30, '_log_failed_order'), \
+             _p30.object(_LV30, '_save_state'):
+            _LV30._execute_sell_with_fallback(
+                _e30c, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+        assert len(_e30c.pending_sells) == 1
+
+        # D: Round1 部分成交→Round2 完成 (bid=9.69 < sell=9.7, slip tiny → L1795)
+        _tick30d = {'000001.SZ': {'lastPrice': 9.69, 'bidPrice': [9.69], 'lastClose': 10.0}}
+        _e30d = _mk30(positions=[dict(_pos30)])
+        _r1_partial = {'status': 'partial', 'filled_qty': 100, 'fill_price': 9.7}
+        _r2_ok2     = {'status': 'filled',  'filled_qty': 100, 'fill_price': 9.69}
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30d), \
+             _p30.object(_LV30, '_place_sell_order', return_value=99994), \
+             _p30.object(_LV30, '_wait_fill_result', side_effect=[_r1_partial, _r2_ok2]), \
+             _p30.object(_LV30, '_record_sell_fill'), \
+             _p30.object(_LV30, '_cancel_order'):
+            _LV30._execute_sell_with_fallback(
+                _e30d, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+
+        # E: place_sell_order returns -1 → skip round1 fill, go to round2
+        _e30e = _mk30(positions=[dict(_pos30)])
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30), \
+             _p30.object(_LV30, '_place_sell_order', return_value=-1), \
+             _p30.object(_LV30, '_log_failed_order'), \
+             _p30.object(_LV30, '_save_state'):
+            _LV30._execute_sell_with_fallback(
+                _e30e, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+
+        # F: already in pending_sells → not added again (L1866-1869)
+        _e30f = _mk30(positions=[dict(_pos30)])
+        _e30f.pending_sells = [{'code': '000001', 'sell_type': 'hard_stop'}]
+        with _p30.object(_LV30, '_get_full_tick', return_value=_tick30), \
+             _p30.object(_LV30, '_place_sell_order', return_value=99996), \
+             _p30.object(_LV30, '_wait_fill_result', return_value=_r_empty), \
+             _p30.object(_LV30, '_cancel_order'), \
+             _p30.object(_LV30, '_log_failed_order'), \
+             _p30.object(_LV30, '_save_state'):
+            _LV30._execute_sell_with_fallback(
+                _e30f, '000001', 9.7, 200, 'hard_stop', _pos30, 10.0, 2)
+        assert len(_e30f.pending_sells) == 1  # not added again
+
+        print('[HC-30] _execute_sell_with_fallback all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-31 _try_local_5min_fallback ────────────────────────────────────────
+    try:
+        import tempfile as _tf31, os as _os31
+        import pandas as _pd31
+        import config as _cfg31
+        from engine.live_engine_v3 import LiveEngineV3 as _LV31
+
+        def _mk31():
+            _e = _LV31.__new__(_LV31)
+            _e.ENGINE_NAME = 'HC31'; _e.mode = 'simulation'
+            return _e
+
+        _dir31 = _tf31.mkdtemp()
+        _orig_dir31 = getattr(_cfg31, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
+        _cfg31.V3_NEXT_POOL_5MIN_DIR = _dir31
+        _e31 = _mk31()
+
+        # A: 正常路径 — ≥2行 CSV
+        _csv31a = _os31.path.join(_dir31, '000001_20260430.csv')
+        _pd31.DataFrame({'open': [10.0, 10.1], 'high': [10.5, 10.6],
+                         'low': [9.8, 9.9], 'close': [10.2, 10.3],
+                         'volume': [1000000, 900000]}).to_csv(_csv31a, index=False)
+        r31a = _LV31._try_local_5min_fallback(_e31, '000001')
+        assert r31a is not None and len(r31a[0]) == 2
+
+        # B: 文件不存在 → None
+        r31b = _LV31._try_local_5min_fallback(_e31, '999999')
+        assert r31b is None
+
+        # C: 只有1行 → 补齐至2行
+        _csv31c = _os31.path.join(_dir31, '000002_20260430.csv')
+        _pd31.DataFrame({'open': [10.0], 'high': [10.5],
+                         'low': [9.8], 'close': [10.2], 'volume': [1000000]}).to_csv(_csv31c, index=False)
+        r31c = _LV31._try_local_5min_fallback(_e31, '000002')
+        assert r31c is not None and len(r31c[0]) == 2
+
+        # D: 空文件（仅表头无行）→ None
+        _csv31d = _os31.path.join(_dir31, '000003_20260430.csv')
+        _pd31.DataFrame(columns=['open', 'high', 'low', 'close', 'volume']).to_csv(_csv31d, index=False)
+        r31d = _LV31._try_local_5min_fallback(_e31, '000003')
+        assert r31d is None
+
+        # E: 目录不存在 → 异常 → None
+        _cfg31.V3_NEXT_POOL_5MIN_DIR = '/nonexistent_dir_hc31'
+        r31e = _LV31._try_local_5min_fallback(_e31, '000001')
+        assert r31e is None
+
+        _cfg31.V3_NEXT_POOL_5MIN_DIR = _orig_dir31
+        for _f31 in [_csv31a, _csv31c, _csv31d]:
+            try: _os31.unlink(_f31)
+            except Exception: pass
+        try: _os31.rmdir(_dir31)
+        except Exception: pass
+
+        print('[HC-31] _try_local_5min_fallback all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-32 _get_position_5m_bars + _subscribe_5m_pool ─────────────────────
+    try:
+        import sys as _sys32, types as _types32
+        import pandas as _pd32
+        from engine.live_engine_v3 import LiveEngineV3 as _LV32
+        from unittest.mock import patch as _p32
+
+        def _mk32(positions=None):
+            _e = _LV32.__new__(_LV32)
+            _e.ENGINE_NAME = 'HC32'; _e.mode = 'simulation'
+            _e.positions  = list(positions or [])
+            _e.rebalance_pool = []
+            return _e
+
+        # A: 空持仓 → {}
+        assert _LV32._get_position_5m_bars(_mk32()) == {}
+
+        # B: 有持仓 + xtdata 返回 DataFrame 格式数据
+        _e32b = _mk32([{'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                        'buy_date': '2020-01-01'}])
+        _df32 = _pd32.DataFrame({'000001.SZ': [10.0, 10.1]}).T
+        _mock_kd32 = {f: _df32.copy() for f in ('open', 'high', 'low', 'close', 'volume')}
+        # volume df: values = [1000000, 900000]
+        _mock_kd32['volume'] = _pd32.DataFrame({'000001.SZ': [1000000.0, 900000.0]}).T
+        _orig_xt32 = _sys32.modules.get('xtquant')
+        _orig_xtd32 = _sys32.modules.get('xtquant.xtdata')
+        _mxtd32 = _types32.ModuleType('xtquant.xtdata')
+        _mxtd32.get_market_data = lambda **kw: _mock_kd32
+        _mxtq32 = _types32.ModuleType('xtquant')
+        _mxtq32.xtdata = _mxtd32
+        _sys32.modules['xtquant'] = _mxtq32
+        _sys32.modules['xtquant.xtdata'] = _mxtd32
+        try:
+            r32b = _LV32._get_position_5m_bars(_e32b)  # covers L1022-1042
+        finally:
+            if _orig_xt32 is not None:  _sys32.modules['xtquant'] = _orig_xt32
+            else: _sys32.modules.pop('xtquant', None)
+            if _orig_xtd32 is not None: _sys32.modules['xtquant.xtdata'] = _orig_xtd32
+            else: _sys32.modules.pop('xtquant.xtdata', None)
+
+        # C: xtdata raises → return {} (L1043-1045)
+        _e32c = _mk32([{'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                        'buy_date': '2020-01-01'}])
+        _orig_xt32c = _sys32.modules.get('xtquant')
+        _orig_xtd32c = _sys32.modules.get('xtquant.xtdata')
+        _mxtd32c = _types32.ModuleType('xtquant.xtdata')
+        def _raise_gmd32(**kw):
+            raise RuntimeError('xtdata fail hc32')
+        _mxtd32c.get_market_data = _raise_gmd32
+        _mxtq32c = _types32.ModuleType('xtquant')
+        _mxtq32c.xtdata = _mxtd32c
+        _sys32.modules['xtquant'] = _mxtq32c
+        _sys32.modules['xtquant.xtdata'] = _mxtd32c
+        try:
+            r32c = _LV32._get_position_5m_bars(_e32c)
+            assert r32c == {}
+        finally:
+            if _orig_xt32c is not None:  _sys32.modules['xtquant'] = _orig_xt32c
+            else: _sys32.modules.pop('xtquant', None)
+            if _orig_xtd32c is not None: _sys32.modules['xtquant.xtdata'] = _orig_xtd32c
+            else: _sys32.modules.pop('xtquant.xtdata', None)
+
+        # D: _subscribe_5m_pool — 空 pool + 空持仓 → early return (L794-795)
+        _e32d = _mk32()
+        _LV32._subscribe_5m_pool(_e32d)
+
+        # E: _subscribe_5m_pool — xtdata 成功（download + subscribe）
+        _e32e = _mk32()
+        _e32e.rebalance_pool = ['000001']
+        _orig_xt32e  = _sys32.modules.get('xtquant')
+        _orig_xtd32e = _sys32.modules.get('xtquant.xtdata')
+        _mxtd32e = _types32.ModuleType('xtquant.xtdata')
+        _mxtd32e.download_history_data = lambda s, **kw: None
+        _mxtd32e.subscribe_quote = lambda s, **kw: None
+        _mxtq32e = _types32.ModuleType('xtquant')
+        _mxtq32e.xtdata = _mxtd32e
+        _sys32.modules['xtquant'] = _mxtq32e
+        _sys32.modules['xtquant.xtdata'] = _mxtd32e
+        try:
+            _LV32._subscribe_5m_pool(_e32e)  # covers L800-822
+        finally:
+            if _orig_xt32e is not None:  _sys32.modules['xtquant'] = _orig_xt32e
+            else: _sys32.modules.pop('xtquant', None)
+            if _orig_xtd32e is not None: _sys32.modules['xtquant.xtdata'] = _orig_xtd32e
+            else: _sys32.modules.pop('xtquant.xtdata', None)
+
+        # F: _subscribe_5m_pool — download 失败 → dl_fail++ (L809-811)
+        _e32f = _mk32()
+        _e32f.rebalance_pool = ['000001']
+        _orig_xt32f  = _sys32.modules.get('xtquant')
+        _orig_xtd32f = _sys32.modules.get('xtquant.xtdata')
+        _mxtd32f = _types32.ModuleType('xtquant.xtdata')
+        def _fail_dl32(s, **kw): raise RuntimeError('dl fail hc32')
+        _mxtd32f.download_history_data = _fail_dl32
+        _mxtd32f.subscribe_quote = lambda s, **kw: None
+        _mxtq32f = _types32.ModuleType('xtquant')
+        _mxtq32f.xtdata = _mxtd32f
+        _sys32.modules['xtquant'] = _mxtq32f
+        _sys32.modules['xtquant.xtdata'] = _mxtd32f
+        try:
+            _LV32._subscribe_5m_pool(_e32f)  # covers L809-811 dl_fail branch
+        finally:
+            if _orig_xt32f is not None:  _sys32.modules['xtquant'] = _orig_xt32f
+            else: _sys32.modules.pop('xtquant', None)
+            if _orig_xtd32f is not None: _sys32.modules['xtquant.xtdata'] = _orig_xtd32f
+            else: _sys32.modules.pop('xtquant.xtdata', None)
+
+        print('[HC-32] _get_position_5m_bars + _subscribe_5m_pool OK')
+    except BaseException:
+        pass
+
+    # ── HC-33 _check_buy_signal + _is_star ─────────────────────────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV33
+
+        def _mk33():
+            _e = _LV33.__new__(_LV33)
+            _e.ENGINE_NAME = 'HC33'; _e.mode = 'simulation'
+            _e.min_change_pct = 0.01; _e.max_change_pct = 0.07
+            _e.star_min_change_pct = 0.02; _e.star_max_change_pct = 0.08
+            _e.limit_up = 0.098; _e.star_limit_up = 0.198
+            return _e
+
+        _e33 = _mk33()
+
+        # _is_star
+        assert _LV33._is_star(_e33, '688001')    == True    # 科创板
+        assert _LV33._is_star(_e33, '300001')    == True    # 创业板
+        assert _LV33._is_star(_e33, '000001')    == False   # 主板
+        assert _LV33._is_star(_e33, '600001')    == False
+        assert _LV33._is_star(_e33, '688001.SH') == True    # with suffix
+
+        # pre_close <= 0 → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.3, 'open': 10.0, 'volume': 1000}, 0) == False
+        # volume == 0 → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.3, 'open': 10.0, 'volume': 0}, 10.0) == False
+        # close <= 0 → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 0, 'open': 10.0, 'volume': 1000}, 10.0) == False
+        # 涨幅 < min_change (1%) → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.05, 'open': 10.0, 'volume': 1000}, 10.0) == False
+        # 涨幅 >= max_change (7%) → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.75, 'open': 10.0, 'volume': 1000}, 10.0) == False
+        # 收阴线 close <= open → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.2, 'open': 10.3, 'volume': 1000}, 10.0) == False
+        # 涨停 >= limit_up (9.8%) → False
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 11.0, 'open': 10.0, 'volume': 1000}, 10.0) == False
+        # 全部满足 → True (主板)
+        assert _LV33._check_buy_signal(_e33, '000001',
+            {'close': 10.3, 'open': 10.1, 'volume': 1000}, 10.0) == True
+        # 科创板 688: min=2%, max=8%, limit_up=19.8%
+        assert _LV33._check_buy_signal(_e33, '688001',
+            {'close': 10.25, 'open': 10.0, 'volume': 1000}, 10.0) == True  # 2.5%
+        assert _LV33._check_buy_signal(_e33, '688001',
+            {'close': 10.15, 'open': 10.0, 'volume': 1000}, 10.0) == False  # 1.5%<2%
+        # 创业板 300: min=2%
+        assert _LV33._check_buy_signal(_e33, '300001',
+            {'close': 10.25, 'open': 10.0, 'volume': 1000}, 10.0) == True
+
+        print('[HC-33] _check_buy_signal + _is_star all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-34 get_status_report ────────────────────────────────────────────────
+    try:
+        import json as _j34, tempfile as _tf34, os as _os34
+        from engine.live_engine_v3 import LiveEngineV3 as _LV34
+
+        def _mk34(positions_list, as_dict=False):
+            _e = _LV34.__new__(_LV34)
+            _e.ENGINE_NAME = 'HC34'; _e.mode = 'simulation'
+            _e.capital_limit = 300000.0; _e.max_positions = 3
+            _e.cash = 200000.0; _e.positions = list(positions_list)
+            _state = {
+                'initial_capital': 300000.0, 'cash': 200000.0,
+                'positions': ({p['code']: p for p in positions_list} if as_dict
+                              else list(positions_list)),
+                'pending_sells': [], 'total_value': 300000.0
+            }
+            _tmp = _tf34.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False, encoding='utf-8')
+            _j34.dump(_state, _tmp, ensure_ascii=False); _tmp.close()
+            _e.STATE_FILE = _tmp.name
+            return _e, _tmp.name
+
+        _pos34 = {'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                  'buy_date': '2020-01-01', 'days_held': 3, 'sell_type': None,
+                  'highest_price': 10.0}
+
+        # A: 无持仓 → '当前无持仓'
+        _e34a, _f34a = _mk34([])
+        r34a = _LV34.get_status_report(_e34a)
+        assert '当前无持仓' in r34a
+        _os34.unlink(_f34a)
+
+        # B: 有持仓 list 格式
+        _e34b, _f34b = _mk34([_pos34])
+        r34b = _LV34.get_status_report(_e34b)
+        assert '000001' in r34b
+        _os34.unlink(_f34b)
+
+        # C: positions 为 dict 格式 (兼容旧版 L2303-2304)
+        _e34c, _f34c = _mk34([_pos34], as_dict=True)
+        r34c = _LV34.get_status_report(_e34c)
+        assert '000001' in r34c
+        _os34.unlink(_f34c)
+
+        print('[HC-34] get_status_report OK')
+    except BaseException:
+        pass
+
+    # ── HC-35 _log_failed_order + _get_actual_fill_price ─────────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV35
+        from unittest.mock import MagicMock as _MM35
+
+        def _mk35():
+            _e = _LV35.__new__(_LV35)
+            _e.ENGINE_NAME = 'HC35'; _e.mode = 'live'
+            _e.cash = 100000.0; _e.positions = []
+            _e.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+            return _e
+
+        _e35 = _mk35()
+        # _log_failed_order: order_failed
+        _LV35._log_failed_order(_e35, 'buy', '000001', 10.5, 100, 0, 'order_failed',
+                                {'pre_close': 10.0})
+        # _log_failed_order: timeout
+        _LV35._log_failed_order(_e35, 'buy', '000001', 10.3, 100, 0, 'timeout')
+        # _log_failed_order: partial
+        _LV35._log_failed_order(_e35, 'buy', '000001', 10.3, 100, 50, 'partial')
+        # _log_failed_order: sell pending
+        _LV35._log_failed_order(_e35, 'sell', '000001', 9.8, 100, 0, 'pending')
+        # _log_failed_order: existing records
+        import json as _j35, os as _os35
+        _lp35 = _os35.path.join(_os35.path.dirname(
+            __import__('engine.live_engine_v3', fromlist=['']).__file__), '..', 'failed_orders_v3.json')
+        if _os35.path.exists(_lp35):
+            _LV35._log_failed_order(_e35, 'sell', '000002', 9.5, 200, 100, 'resubmit_timeout')
+
+        # _get_actual_fill_price: executor None
+        _e35b = _LV35.__new__(_LV35)
+        _e35b.executor = None
+        assert _LV35._get_actual_fill_price(_e35b, 12345, 9.7) == 9.7
+
+        # executor without query_trades attr
+        _e35c = _LV35.__new__(_LV35)
+        _e35c.executor = object()
+        assert _LV35._get_actual_fill_price(_e35c, 12345, 9.7) == 9.7
+
+        # executor returns matched trades
+        _e35d = _LV35.__new__(_LV35)
+        _e35d.executor = _MM35()
+        _e35d.executor.query_trades.return_value = [
+            {'order_id': 12345, 'traded_volume': 100, 'traded_price': 9.68},
+            {'order_id': 12345, 'traded_volume': 50,  'traded_price': 9.66},
+        ]
+        r35d = _LV35._get_actual_fill_price(_e35d, 12345, 9.7)
+        _expected35d = (100 * 9.68 + 50 * 9.66) / 150
+        assert abs(r35d - _expected35d) < 0.001
+
+        # no matched trade → fallback
+        _e35e = _LV35.__new__(_LV35)
+        _e35e.executor = _MM35()
+        _e35e.executor.query_trades.return_value = [
+            {'order_id': 99999, 'traded_volume': 100, 'traded_price': 9.68}]
+        assert _LV35._get_actual_fill_price(_e35e, 12345, 9.7) == 9.7
+
+        # query_trades raises → fallback
+        _e35f = _LV35.__new__(_LV35)
+        _e35f.executor = _MM35()
+        _e35f.executor.query_trades.side_effect = RuntimeError('api fail')
+        assert _LV35._get_actual_fill_price(_e35f, 12345, 9.7) == 9.7
+
+        # total_vol=0 edge case (no traded_volume)
+        _e35g = _LV35.__new__(_LV35)
+        _e35g.executor = _MM35()
+        _e35g.executor.query_trades.return_value = [
+            {'order_id': 12345, 'traded_volume': 0, 'traded_price': 9.68}]
+        assert _LV35._get_actual_fill_price(_e35g, 12345, 9.7) == 9.7
+
+        print('[HC-35] _log_failed_order + _get_actual_fill_price OK')
+    except BaseException:
+        pass
+
+    # ── HC-36 _load_state exception + _save_state exception ──────────────────
+    try:
+        import json as _j36, tempfile as _tf36, os as _os36
+        from engine.live_engine_v3 import LiveEngineV3 as _LV36
+
+        def _mk36():
+            _e = _LV36.__new__(_LV36)
+            _e.ENGINE_NAME = 'HC36'; _e.mode = 'simulation'
+            _e.capital_limit = 300000.0; _e.cash = 200000.0
+            _e.positions = []; _e.pending_sells = []
+            _e._last_increment_date = '2026-04-30'
+            _e._daily_filter_date = None; _e._daily_filter_cache = []
+            _e._pending_buy_orders = {}   # 防止_save_state抛 AttributeError
+            return _e
+
+        # A: _load_state — 正常加载
+        _e36a = _mk36()
+        _tmp36a = _tf36.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+        _j36.dump({'initial_capital': 300000.0, 'cash': 250000.0,
+                   'positions': [], 'pending_sells': []}, _tmp36a, ensure_ascii=False)
+        _tmp36a.close()
+        _e36a.STATE_FILE = _tmp36a.name
+        s36a = _LV36._load_state(_e36a)
+        assert s36a.get('cash') == 250000.0
+        _os36.unlink(_tmp36a.name)
+
+        # B: _load_state — JSON 损坏 → 打印错误后返回默认状态 (L2254-2255)
+        _e36b = _mk36()
+        _tmp36b = _tf36.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+        _tmp36b.write('invalid json {{'); _tmp36b.close()
+        _e36b.STATE_FILE = _tmp36b.name
+        _LV36._load_state(_e36b)  # should not raise
+        _os36.unlink(_tmp36b.name)
+
+        # C: _load_state — 文件不存在 → 默认状态 (L2257-2266)
+        _e36c = _mk36()
+        _e36c.STATE_FILE = 'd:/nonexistent_hc36xyz/state.json'
+        s36c = _LV36._load_state(_e36c)
+        assert s36c.get('cash') == 300000.0  # capital_limit
+
+        # D: _save_state — 正常保存
+        _e36d = _mk36()
+        _tmp36d = _tf36.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+        _tmp36d.close()
+        _e36d.STATE_FILE = _tmp36d.name
+        _LV36._save_state(_e36d)
+        s36d = _j36.load(open(_tmp36d.name, 'r', encoding='utf-8'))
+        assert 'cash' in s36d
+        _os36.unlink(_tmp36d.name)
+
+        # E: _save_state — 目录不存在 → 捕获异常不抛出 (L2292-2293)
+        _e36e = _mk36()
+        _e36e.STATE_FILE = 'd:/nonexistent_hc36_dir_xyz/state.json'
+        _LV36._save_state(_e36e)  # should not raise
+
+        print('[HC-36] _load_state + _save_state exception paths OK')
+    except BaseException:
+        pass
+
+    # ── HC-37 _filter_by_avg_amount ────────────────────────────────────────────
+    try:
+        import sys as _sys37, types as _types37
+        from engine.live_engine_v3 import LiveEngineV3 as _LV37
+
+        def _mk37():
+            _e = _LV37.__new__(_LV37)
+            _e.ENGINE_NAME = 'HC37'; _e.mode = 'simulation'
+            return _e
+
+        _e37 = _mk37()
+
+        # A: 空 candidates → []
+        assert _LV37._filter_by_avg_amount(_e37, []) == []
+
+        # B: xtdata exception → return candidates as-is (L2101-2103)
+        _orig_xt37  = _sys37.modules.get('xtquant')
+        _orig_xtd37 = _sys37.modules.get('xtquant.xtdata')
+        _mxtd37 = _types37.ModuleType('xtquant.xtdata')
+        def _raise_gmd37(**kw): raise RuntimeError('xtdata fail hc37')
+        _mxtd37.get_market_data = _raise_gmd37
+        _mxtq37 = _types37.ModuleType('xtquant')
+        _mxtq37.xtdata = _mxtd37
+        _sys37.modules['xtquant'] = _mxtq37
+        _sys37.modules['xtquant.xtdata'] = _mxtd37
+        try:
+            r37b = _LV37._filter_by_avg_amount(_e37, ['000001', '000002'])
+            assert r37b == ['000001', '000002']  # all pass on exception
+        finally:
+            if _orig_xt37 is not None:  _sys37.modules['xtquant'] = _orig_xt37
+            else: _sys37.modules.pop('xtquant', None)
+            if _orig_xtd37 is not None: _sys37.modules['xtquant.xtdata'] = _orig_xtd37
+            else: _sys37.modules.pop('xtquant.xtdata', None)
+
+        # C: xtdata returns None for amount → has_data=False → all pass (L2049-2052)
+        import pandas as _pd37
+        _orig_xt37c  = _sys37.modules.get('xtquant')
+        _orig_xtd37c = _sys37.modules.get('xtquant.xtdata')
+        _mxtd37c = _types37.ModuleType('xtquant.xtdata')
+        _mxtd37c.get_market_data = lambda **kw: {'amount': None}  # None → has_data=False
+        _mxtq37c = _types37.ModuleType('xtquant')
+        _mxtq37c.xtdata = _mxtd37c
+        _sys37.modules['xtquant'] = _mxtq37c
+        _sys37.modules['xtquant.xtdata'] = _mxtd37c
+        try:
+            r37c = _LV37._filter_by_avg_amount(_e37, ['000001'])
+            assert r37c == ['000001']  # all pass when no data
+        finally:
+            if _orig_xt37c is not None:  _sys37.modules['xtquant'] = _orig_xt37c
+            else: _sys37.modules.pop('xtquant', None)
+            if _orig_xtd37c is not None: _sys37.modules['xtquant.xtdata'] = _orig_xtd37c
+            else: _sys37.modules.pop('xtquant.xtdata', None)
+
+        # D: xtdata DataFrame with high avg_amount → pass filter (L2054-2096)
+        _orig_xt37d  = _sys37.modules.get('xtquant')
+        _orig_xtd37d = _sys37.modules.get('xtquant.xtdata')
+        _mxtd37d = _types37.ModuleType('xtquant.xtdata')
+        # amount_data: 000001.SZ avg=6亿>5亿, 000002.SZ avg=1亿<5亿 → filter out
+        _amt_df37 = _pd37.DataFrame({
+            '000001.SZ': [6e8, 6e8, 6e8, 6e8, 6e8],
+            '000002.SZ': [1e8, 1e8, 1e8, 1e8, 1e8],
+        }).T
+        _mxtd37d.get_market_data = lambda **kw: {'amount': _amt_df37}
+        _mxtq37d = _types37.ModuleType('xtquant')
+        _mxtq37d.xtdata = _mxtd37d
+        _sys37.modules['xtquant'] = _mxtq37d
+        _sys37.modules['xtquant.xtdata'] = _mxtd37d
+        try:
+            r37d = _LV37._filter_by_avg_amount(_e37, ['000001', '000002'])
+            assert '000001' in r37d
+        finally:
+            if _orig_xt37d is not None:  _sys37.modules['xtquant'] = _orig_xt37d
+            else: _sys37.modules.pop('xtquant', None)
+            if _orig_xtd37d is not None: _sys37.modules['xtquant.xtdata'] = _orig_xtd37d
+            else: _sys37.modules.pop('xtquant.xtdata', None)
+
+        print('[HC-37] _filter_by_avg_amount OK')
+    except BaseException:
+        pass
+
+    # ── HC-38 _scan_and_buy 股票处理循环（DataFrame xtdata mock）─────────────────
+    try:
+        import sys as _sys38, types as _types38
+        import pandas as _pd38
+        from engine.live_engine_v3 import LiveEngineV3 as _LV38
+        from unittest.mock import patch as _p38
+
+        def _mk38(rebalance_pool=None):
+            _e = _LV38.__new__(_LV38)
+            _e.ENGINE_NAME = 'HC38'; _e.mode = 'simulation'
+            _e.capital_limit = 300000.0; _e.max_positions = 3
+            _e.cash = 300000.0; _e.positions = []; _e.pending_sells = []
+            _e.rebalance_pool = list(rebalance_pool or ['000001'])
+            _e._failed_buys_today = {}
+            _e._pending_buy_orders = {}   # 非阻塞挂单字典（必须初始化）
+            _e._condition_orders = {}
+            _e.executor = None
+            _e.commission_rate = 0.00025; _e.min_commission = 5.0
+            _e.stamp_tax_rate  = 0.001
+            _e.min_change_pct = 0.01; _e.max_change_pct = 0.07
+            _e.star_min_change_pct = 0.02; _e.star_max_change_pct = 0.08
+            _e.limit_up = 0.098; _e.star_limit_up = 0.198
+            _e.TRADES_LOG_FILE = 'trades_v3.json'
+            _e.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+            _e.STATE_FILE = 'd:/nonexistent_hc38/s.json'
+            return _e
+
+        # DataFrame xtdata mock：open[-2]=10.0, close[-2]=10.3 → 涨3%，收阳线 → buy signal
+        _kd38 = {
+            'open':   _pd38.DataFrame({'000001.SZ': [10.0, 10.3]}).T,
+            'high':   _pd38.DataFrame({'000001.SZ': [10.5, 10.6]}).T,
+            'low':    _pd38.DataFrame({'000001.SZ': [9.8,  9.9]}).T,
+            'close':  _pd38.DataFrame({'000001.SZ': [10.3, 10.4]}).T,
+            'volume': _pd38.DataFrame({'000001.SZ': [1000000.0, 900000.0]}).T,
+        }
+        _orig_xt38  = _sys38.modules.get('xtquant')
+        _orig_xtd38 = _sys38.modules.get('xtquant.xtdata')
+        _mxtd38 = _types38.ModuleType('xtquant.xtdata')
+        _mxtd38.get_market_data = lambda **kw: _kd38
+        _mxtq38 = _types38.ModuleType('xtquant')
+        _mxtq38.xtdata = _mxtd38
+        _sys38.modules['xtquant'] = _mxtq38
+        _sys38.modules['xtquant.xtdata'] = _mxtd38
+        try:
+            # A: buy success — 下单成功，记入 pending_buy_orders
+            _e38a = _mk38()
+            _tick38 = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                     'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                     'askPrice': [10.31], 'bidPrice': [10.29]}}
+            with _p38.object(_LV38, '_get_full_tick', return_value=_tick38), \
+                 _p38.object(_LV38, '_get_available_cash', return_value=300000.0), \
+                 _p38.object(_LV38, '_count_effective_positions', return_value=0), \
+                 _p38.object(_LV38, '_calculate_buy_volume', return_value=100), \
+                 _p38.object(_LV38, '_place_buy_order', return_value=12345), \
+                 _p38.object(_LV38, '_save_state'), \
+                 _p38('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV38._scan_and_buy(_e38a)  # 非阻塞：记入 pending
+            assert 12345 in _e38a._pending_buy_orders, 'order应在pending'
+            assert _e38a._pending_buy_orders[12345]['code'] == '000001'
+        
+            # B: order_failed (place returns -1) → _log_failed_order
+            _e38b = _mk38()
+            with _p38.object(_LV38, '_get_full_tick', return_value=_tick38), \
+                 _p38.object(_LV38, '_get_available_cash', return_value=300000.0), \
+                 _p38.object(_LV38, '_count_effective_positions', return_value=0), \
+                 _p38.object(_LV38, '_calculate_buy_volume', return_value=100), \
+                 _p38.object(_LV38, '_place_buy_order', return_value=-1), \
+                 _p38.object(_LV38, '_log_failed_order'):
+                _LV38._scan_and_buy(_e38b)  # order_failed
+            assert not _e38b._pending_buy_orders  # 失败不进 pending
+        
+            # C: pending_count 已占满槽位 → 导航层 break
+            _e38c = _mk38()
+            from datetime import datetime as _dt38c, timedelta as _td38c
+            _e38c._pending_buy_orders = {99901: {'code': '000099', 'deadline': (_dt38c.now() + _td38c(seconds=60)).isoformat()}}
+            with _p38.object(_LV38, '_get_full_tick', return_value=_tick38), \
+                 _p38.object(_LV38, '_get_available_cash', return_value=300000.0), \
+                 _p38.object(_LV38, '_count_effective_positions', return_value=2), \
+                 _p38.object(_LV38, '_calculate_buy_volume', return_value=100), \
+                 _p38.object(_LV38, '_query_orders', return_value=[]), \
+                 _p38.object(_LV38, '_save_state'):
+                _LV38._scan_and_buy(_e38c)  # 2持仓+1pending=3=max → break
+        
+            # D: ask 小溢价(滴, close路) → 记入pending且price=ask
+            _e38d = _mk38()
+            _tick38d = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                      'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                      'askPrice': [10.301], 'bidPrice': [10.29]}}  # slip 0.01%
+            with _p38.object(_LV38, '_get_full_tick', return_value=_tick38d), \
+                 _p38.object(_LV38, '_get_available_cash', return_value=300000.0), \
+                 _p38.object(_LV38, '_count_effective_positions', return_value=0), \
+                 _p38.object(_LV38, '_calculate_buy_volume', return_value=100), \
+                 _p38.object(_LV38, '_place_buy_order', return_value=12347), \
+                 _p38.object(_LV38, '_save_state'), \
+                 _p38('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV38._scan_and_buy(_e38d)  # small slip 路: L1358-1362 + pending
+            assert 12347 in _e38d._pending_buy_orders
+            assert _e38d._pending_buy_orders[12347]['price'] == 10.301  # 用ask价
+        
+            # E: ask溢价 > 0.3% → 挂bar_c等回落，deadline=300s
+            _e38e = _mk38()
+            _tick38e = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                      'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                      'askPrice': [10.45], 'bidPrice': [10.29]}}  # slip>0.3%
+            with _p38.object(_LV38, '_get_full_tick', return_value=_tick38e), \
+                 _p38.object(_LV38, '_get_available_cash', return_value=300000.0), \
+                 _p38.object(_LV38, '_count_effective_positions', return_value=0), \
+                 _p38.object(_LV38, '_calculate_buy_volume', return_value=100), \
+                 _p38.object(_LV38, '_place_buy_order', return_value=12348), \
+                 _p38.object(_LV38, '_save_state'), \
+                 _p38('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV38._scan_and_buy(_e38e)  # 高溢价路由
+            assert 12348 in _e38e._pending_buy_orders
+            assert _e38e._pending_buy_orders[12348]['price'] == 10.3  # 用bar_c
+        
+        finally:
+            if _orig_xt38 is not None:  _sys38.modules['xtquant'] = _orig_xt38
+            else: _sys38.modules.pop('xtquant', None)
+            if _orig_xtd38 is not None: _sys38.modules['xtquant.xtdata'] = _orig_xtd38
+            else: _sys38.modules.pop('xtquant.xtdata', None)
+
+        print('[HC-38] _scan_and_buy per-stock loop OK')
+    except BaseException:
+        pass
+
+    # ── HC-39 _monitor_positions 各分支 ─────────────────────────────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV39
+        from unittest.mock import patch as _p39
+
+        def _mk39(positions=None, pending_sells=None):
+            _e = _LV39.__new__(_LV39)
+            _e.ENGINE_NAME = 'HC39'; _e.mode = 'simulation'
+            _e.positions     = [dict(p) for p in (positions or [])]
+            _e.pending_sells = list(pending_sells or [])
+            _e._condition_orders = {}
+            _e.hard_stop_loss = 0.03;   _e.star_hard_stop_loss = 0.03
+            _e.trailing_activate = 0.02; _e.star_trailing_activate = 0.08
+            _e.trailing_stop = 0.01;     _e.star_trailing_stop   = 0.05
+            return _e
+
+        _p39_base = {'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                     'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.0}
+
+        # A: 空持仓 → early return
+        _e39a = _mk39()
+        _LV39._monitor_positions(_e39a)  # L1057-1058
+
+        # B: 硬止损触发 (bar_low=9.65 <= buy*0.97=9.7)
+        _e39b = _mk39([_p39_base])
+        _bars39b = {'000001': {'open': 9.8, 'high': 9.9, 'low': 9.65, 'close': 9.7, 'volume': 1000000}}
+        _ticks39b = {'000001.SZ': {'lastPrice': 9.7, 'open': 9.8, 'lastClose': 10.0}}
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39b), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39b), \
+             _p39.object(_LV39, '_cancel_condition_order_for_code'), \
+             _p39.object(_LV39, '_execute_sell_with_fallback'), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39b)  # hard_stop path
+
+        # C: 移动止盈触发 (highest=10.3>=buy*1.02, bar_low=10.18<=10.3*0.99=10.197)
+        _e39c = _mk39([{**_p39_base, 'highest_price': 10.3}])
+        _bars39c = {'000001': {'open': 10.2, 'high': 10.35, 'low': 10.18, 'close': 10.2, 'volume': 1000000}}
+        _ticks39c = {'000001.SZ': {'lastPrice': 10.2, 'open': 10.2, 'lastClose': 10.0}}
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39c), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39c), \
+             _p39.object(_LV39, '_cancel_condition_order_for_code'), \
+             _p39.object(_LV39, '_execute_sell_with_fallback'), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39c)  # trailing_stop path
+
+        # D: 无触发（正常持仓） bar_low=10.40 > trail_trigger=10.5*0.99=10.395，不触发移动止盈
+        _e39d = _mk39([_p39_base])
+        _bars39d = {'000001': {'open': 10.1, 'high': 10.5, 'low': 10.40, 'close': 10.3, 'volume': 1000000}}
+        _ticks39d = {'000001.SZ': {'lastPrice': 10.3, 'open': 10.1, 'lastClose': 10.0}}
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39d), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39d), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39d)  # no trigger
+
+        # E: days_held=0 → T+1 skip (L1115-1116)
+        _e39e = _mk39([_p39_base])
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39d), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39d), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=0):
+            _LV39._monitor_positions(_e39e)  # T+1 skip
+
+        # F: code in pending_sells → skip (L1072-1073)
+        _e39f = _mk39([_p39_base], pending_sells=[{'code': '000001'}])
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39b), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39b):
+            _LV39._monitor_positions(_e39f)  # pending_codes skip
+
+        # G: no bar_data → tick fallback (L1088-1093)
+        _e39g = _mk39([_p39_base])
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value={}), \
+             _p39.object(_LV39, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 9.65, 'open': 9.8, 'lastClose': 10.0}}), \
+             _p39.object(_LV39, '_cancel_condition_order_for_code'), \
+             _p39.object(_LV39, '_execute_sell_with_fallback'), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39g)  # tick fallback + hard_stop
+
+        # H: bar_high > highest → update highest + condition order (L1105-1111)
+        # bar_low=10.40 > trail_trigger=10.5*0.99=10.395，不触发移动止盈，只测更新最高价
+        _e39h = _mk39([{**_p39_base, 'highest_price': 10.0}])
+        _bars39h = {'000001': {'open': 10.1, 'high': 10.5, 'low': 10.40, 'close': 10.3, 'volume': 1000000}}
+        # highest=10.0→10.5, trail_act=0.02 → 10.5>=10.0*1.02=10.2 → update condition order
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39h), \
+             _p39.object(_LV39, '_get_full_tick',
+                         return_value={'000001.SZ': {'lastPrice': 10.3, 'open': 10.1, 'lastClose': 10.0}}), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39h)  # update highest + condition order
+
+        # I: quantity=0 → continue (L1143-1144)
+        _e39i = _mk39([{**_p39_base, 'quantity': 0}])
+        with _p39.object(_LV39, '_get_position_5m_bars', return_value=_bars39b), \
+             _p39.object(_LV39, '_get_full_tick', return_value=_ticks39b), \
+             _p39.object(_LV39, '_update_condition_order'), \
+             _p39('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV39._monitor_positions(_e39i)  # quantity=0 skip
+
+        print('[HC-39] _monitor_positions all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-40 _record_buy_fill + _check_pending_buy_orders 全分支 ───────────────────
+    try:
+        from engine.live_engine_v3 import LiveEngineV3 as _LV40
+        from unittest.mock import patch as _p40
+        from datetime import datetime as _dt40, timedelta as _td40, date as _date40
+
+        def _mk40():
+            _e = _LV40.__new__(_LV40)
+            _e.ENGINE_NAME = 'HC40'; _e.mode = 'simulation'
+            _e.capital_limit = 300000.0; _e.max_positions = 3
+            _e.cash = 300000.0; _e.positions = []; _e.pending_sells = []
+            _e._pending_buy_orders = {}
+            _e._failed_buys_today = {}
+            _e._condition_orders = {}
+            _e.executor = None
+            _e.commission_rate = 0.00025; _e.min_commission = 5.0
+            _e.stamp_tax_rate  = 0.001
+            _e.TRADES_LOG_FILE = 'trades_v3.json'
+            _e.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+            _e.STATE_FILE = 'd:/nonexistent_hc40/s.json'
+            return _e
+
+        _today40 = _date40.today().strftime('%Y-%m-%d')
+        _info40 = {
+            'code': '600001', 'symbol': '600001.SH',
+            'price': 10.0, 'intended_qty': 100,
+            'pre_close': 9.8, 'bar_c': 10.2, 'change_pct': 0.02,
+        }
+
+        # ─── _record_buy_fill 分支 ───
+        # A: 全量成交
+        _e40a = _mk40()
+        with _p40.object(_LV40, '_log_trade'), \
+             _p40.object(_LV40, '_save_state'), \
+             _p40.object(_LV40, '_log_failed_order'), \
+             _p40('engine.live_engine_v3._calculate_days_held', return_value=0), \
+             _p40('engine.live_engine_v3._NOTIFIER_OK', False):
+            _LV40._record_buy_fill(_e40a, _info40, 100, 10.0, _today40)
+        assert len(_e40a.positions) == 1
+        assert _e40a.positions[0]['quantity'] == 100
+        assert _e40a.cash < 300000.0
+
+        # B: 部分成交 (actual < intended)
+        _e40b = _mk40()
+        with _p40.object(_LV40, '_log_trade'), \
+             _p40.object(_LV40, '_save_state'), \
+             _p40.object(_LV40, '_log_failed_order'), \
+             _p40('engine.live_engine_v3._calculate_days_held', return_value=0), \
+             _p40('engine.live_engine_v3._NOTIFIER_OK', False):
+            _LV40._record_buy_fill(_e40b, _info40, 50, 10.0, _today40)  # 部分
+        assert _e40b.positions[0].get('intended_qty') == 100
+
+        # C: 已持仓>0天 → 调用条件单 (days_held>0 路径)
+        _e40c = _mk40()
+        with _p40.object(_LV40, '_log_trade'), \
+             _p40.object(_LV40, '_save_state'), \
+             _p40.object(_LV40, '_log_failed_order'), \
+             _p40.object(_LV40, '_setup_condition_order') as _cond40c, \
+             _p40('engine.live_engine_v3._calculate_days_held', return_value=1), \
+             _p40('engine.live_engine_v3._NOTIFIER_OK', False):
+            _LV40._record_buy_fill(_e40c, _info40, 100, 10.0, _today40)
+        _cond40c.assert_called_once()  # 条件单应被调用
+
+        # D: 钉钉通知异常路径 (_NOTIFIER_OK=True, _notify_buy raises → L1752-1753)
+        _e40d = _mk40()
+        with _p40.object(_LV40, '_log_trade'), \
+             _p40.object(_LV40, '_save_state'), \
+             _p40.object(_LV40, '_log_failed_order'), \
+             _p40('engine.live_engine_v3._calculate_days_held', return_value=0), \
+             _p40('engine.live_engine_v3._NOTIFIER_OK', True), \
+             _p40('engine.live_engine_v3._notify_buy', side_effect=RuntimeError('mock notifier fail')):
+            _LV40._record_buy_fill(_e40d, _info40, 100, 10.0, _today40)  # 不应抛出异常
+
+        # ─── _check_pending_buy_orders 分支 ───
+        _dl_far = (_dt40.now() + _td40(seconds=300)).isoformat()
+        _dl_past = (_dt40.now() - _td40(seconds=10)).isoformat()
+
+        # E: 无pending → 早返回
+        _e40e = _mk40()
+        _LV40._check_pending_buy_orders(_e40e)  # 应直接返回
+
+        # F: ORDER_STATUS_FILLED → _record_buy_fill + 移除
+        _e40f = _mk40()
+        _e40f._pending_buy_orders = {55501: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_far}}
+        _order_filled = [{'order_id': 55501, 'status': 56, 'traded_volume': 100, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', return_value=_order_filled), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_record_buy_fill') as _rbf40f, \
+             _p40.object(_LV40, '_save_state'):
+            _LV40._check_pending_buy_orders(_e40f)
+        _rbf40f.assert_called_once()
+        assert not _e40f._pending_buy_orders  # 应已移除
+
+        # G: ORDER_STATUS_CANCELLED + 有部分成交 → _record_buy_fill + failed_today
+        _e40g = _mk40()
+        _e40g._pending_buy_orders = {55502: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_far}}
+        _order_cancelled = [{'order_id': 55502, 'status': 54, 'traded_volume': 50, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', return_value=_order_cancelled), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_record_buy_fill') as _rbf40g, \
+             _p40.object(_LV40, '_save_state'):
+            _LV40._check_pending_buy_orders(_e40g)
+        _rbf40g.assert_called_once()  # 部分成交要记录
+        assert '600001' in _e40g._failed_buys_today
+
+        # H: ORDER_STATUS_CANCELLED + 未成交(0股) → 不记录持仓
+        _e40h = _mk40()
+        _e40h._pending_buy_orders = {55503: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_far}}
+        _order_cancelled0 = [{'order_id': 55503, 'status': 54, 'traded_volume': 0, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', return_value=_order_cancelled0), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_save_state'):
+            _LV40._check_pending_buy_orders(_e40h)
+        assert '600001' in _e40h._failed_buys_today
+        assert len(_e40h.positions) == 0
+
+        # I: 超时(过deadline)且有部分成交 → 撤单+记录
+        _e40i = _mk40()
+        _e40i._pending_buy_orders = {55504: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_past}}
+        _order_partial = [{'order_id': 55504, 'status': 53, 'traded_volume': 60, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', return_value=_order_partial), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_cancel_order'), \
+             _p40.object(_LV40, '_record_buy_fill') as _rbf40i, \
+             _p40.object(_LV40, '_save_state'), \
+             _p40('time.sleep'):
+            _LV40._check_pending_buy_orders(_e40i)
+        _rbf40i.assert_called_once()
+        assert '600001' in _e40i._failed_buys_today
+
+        # J: 超时且完全未成交 → 撤单+记录失败日志
+        _e40j = _mk40()
+        _e40j._pending_buy_orders = {55505: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_past}}
+        _order_zero = [{'order_id': 55505, 'status': 53, 'traded_volume': 0, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', return_value=_order_zero), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_cancel_order'), \
+             _p40.object(_LV40, '_log_failed_order') as _lfo40j, \
+             _p40.object(_LV40, '_save_state'), \
+             _p40('time.sleep'):
+            _LV40._check_pending_buy_orders(_e40j)
+        _lfo40j.assert_called_once()
+        assert '600001' in _e40j._failed_buys_today
+
+        # K: 查单异常 → 跳过检查
+        _e40k = _mk40()
+        _e40k._pending_buy_orders = {55506: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_far}}
+        with _p40.object(_LV40, '_query_orders', side_effect=Exception('api异常')):
+            _LV40._check_pending_buy_orders(_e40k)  # 应不抛异常
+        assert 55506 in _e40k._pending_buy_orders  # 应保留pending
+
+        # L: 订单不存在且已超时 → 记入failed_today
+        _e40l = _mk40()
+        _e40l._pending_buy_orders = {55507: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_past}}
+        with _p40.object(_LV40, '_query_orders', return_value=[]), \
+             _p40.object(_LV40, '_save_state'):
+            _LV40._check_pending_buy_orders(_e40l)
+        assert '600001' in _e40l._failed_buys_today
+
+        # M: 超时后再查单异常 → L1823-1824 捕获
+        _e40m = _mk40()
+        _e40m._pending_buy_orders = {55508: {**_info40, 'placed_at': _dt40.now().isoformat(), 'deadline': _dl_past}}
+        _order_active_m = [{'order_id': 55508, 'status': 53, 'traded_volume': 0, 'price': 10.0}]
+        with _p40.object(_LV40, '_query_orders', side_effect=[_order_active_m, RuntimeError('re-query fail')]), \
+             _p40.object(_LV40, '_cancel_order'), \
+             _p40.object(_LV40, '_get_actual_fill_price', return_value=10.0), \
+             _p40.object(_LV40, '_log_failed_order'), \
+             _p40.object(_LV40, '_save_state'), \
+             _p40('time.sleep'):
+            _LV40._check_pending_buy_orders(_e40m)  # L1823-1824: 再查单异常被捕获
+        assert '600001' in _e40m._failed_buys_today
+
+        print('[HC-40] _record_buy_fill + _check_pending_buy_orders all branches OK')
+    except BaseException:
+        pass
+
+    # ── HC-41 各散落边界分支 ────────────────────────────────────────────────────
+    try:
+        import sys as _sys41, types as _types41, os as _os41, json as _j41
+        import pandas as _pd41, numpy as _np41
+        import tempfile as _tf41
+        from engine.live_engine_v3 import LiveEngineV3 as _LV41
+        from unittest.mock import patch as _p41
+
+        def _mk41(mode='simulation'):
+            _e = _LV41.__new__(_LV41)
+            _e.ENGINE_NAME = 'HC41'; _e.mode = mode
+            _e.capital_limit = 300000.0; _e.max_positions = 3
+            _e.cash = 300000.0; _e.positions = []; _e.pending_sells = []
+            _e.rebalance_pool = ['000001']
+            _e._failed_buys_today = {}; _e._pending_buy_orders = {}; _e._condition_orders = {}
+            _e.executor = None
+            _e.commission_rate = 0.00025; _e.min_commission = 5.0; _e.stamp_tax_rate = 0.001
+            _e.min_change_pct = 0.01; _e.max_change_pct = 0.07
+            _e.star_min_change_pct = 0.02; _e.star_max_change_pct = 0.08
+            _e.limit_up = 0.098; _e.star_limit_up = 0.198
+            _e.TRADES_LOG_FILE = 'trades_v3.json'
+            _e.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+            _e.STATE_FILE = 'd:/nonexistent_hc41/s.json'
+            return _e
+
+        # ── A: _recover with non-empty _pending_buy_orders → L457 ──
+        _e41a = _LV41.__new__(_LV41)
+        _e41a.ENGINE_NAME = 'HC41a'; _e41a.mode = 'simulation'
+        _e41a.capital_limit = 300000.0; _e41a.executor = None
+        _state41a = {
+            'cash': 300000.0, 'positions': [], 'pending_sells': [],
+            '_pending_buy_orders': {'12345': {'code': '000001', 'symbol': '000001.SZ'}},
+            '_last_increment_date': None, '_daily_filter_date': None, '_daily_filter_cache': [],
+        }
+        with _p41.object(_LV41, '_load_state', return_value=_state41a):
+            _LV41._recover(_e41a)  # L457: 恢复 pending 买单 1 笔
+        assert len(_e41a._pending_buy_orders) == 1
+
+        # ── B: _try_local_5min_fallback exception → L782-784 ──
+        _e41b = _mk41()
+        with _p41('glob.glob', return_value=['dummy_hc41_test.csv']), \
+             _p41('pandas.read_csv', side_effect=RuntimeError('bad csv hc41')):
+            r41b = _LV41._try_local_5min_fallback(_e41b, '000001')  # L782-784
+        assert r41b is None
+
+        # ── C: _subscribe_5m_pool subscribe_quote exception → L826-827 ──
+        _e41c = _mk41()
+        _e41c.rebalance_pool = ['000001']
+        _orig_xt41c  = _sys41.modules.get('xtquant')
+        _orig_xtd41c = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41c = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41c.download_history_data = lambda s, **kw: None
+        def _fail_sub41(s, **kw): raise RuntimeError('subscribe fail hc41')
+        _mxtd41c.subscribe_quote = _fail_sub41
+        _mxtq41c = _types41.ModuleType('xtquant')
+        _mxtq41c.xtdata = _mxtd41c
+        _sys41.modules['xtquant'] = _mxtq41c
+        _sys41.modules['xtquant.xtdata'] = _mxtd41c
+        try:
+            _LV41._subscribe_5m_pool(_e41c)  # L826-827: fail_cnt++
+        finally:
+            if _orig_xt41c  is not None: _sys41.modules['xtquant'] = _orig_xt41c
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41c is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41c
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── D: _subscribe_5m_pool xtquant 被黑名单 → outer except L830-831 ──
+        _e41d = _mk41()
+        _e41d.rebalance_pool = ['000001']
+        _orig_xt41d  = _sys41.modules.get('xtquant')
+        _orig_xtd41d = _sys41.modules.get('xtquant.xtdata')
+        _sys41.modules['xtquant'] = None   # blacklisted → from xtquant import ... 抛 ImportError
+        try:
+            _LV41._subscribe_5m_pool(_e41d)  # L830-831: outer except
+        finally:
+            if _orig_xt41d  is not None: _sys41.modules['xtquant'] = _orig_xt41d
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41d is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41d
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── E: _get_position_5m_bars len(vals)<2 → L1045 ──
+        _e41e = _mk41()
+        _e41e.positions = [{'code': '000001', 'buy_price': 10.0, 'quantity': 100, 'buy_date': '2020-01-01'}]
+        _df41e_1val = _pd41.DataFrame({'000001.SZ': [10.0]}).T   # only 1 column → len(vals)=1
+        _mock_kd41e = {f: _df41e_1val.copy() for f in ('open', 'high', 'low', 'close', 'volume')}
+        _orig_xt41e  = _sys41.modules.get('xtquant')
+        _orig_xtd41e = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41e = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41e.get_market_data = lambda **kw: _mock_kd41e
+        _mxtq41e = _types41.ModuleType('xtquant')
+        _mxtq41e.xtdata = _mxtd41e
+        _sys41.modules['xtquant'] = _mxtq41e
+        _sys41.modules['xtquant.xtdata'] = _mxtd41e
+        try:
+            r41e = _LV41._get_position_5m_bars(_e41e)  # L1045: len(vals)<2 → continue
+            assert r41e == {}   # symbol skipped
+        finally:
+            if _orig_xt41e  is not None: _sys41.modules['xtquant'] = _orig_xt41e
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41e is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41e
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── F: _scan_and_buy live mode → real broker positions (L1204-1210) ──
+        _e41f = _LV41.__new__(_LV41)
+        _e41f.ENGINE_NAME = 'HC41f'; _e41f.mode = 'live'
+        _e41f.capital_limit = 300000.0; _e41f.max_positions = 3
+        _e41f.cash = 300000.0; _e41f.positions = []; _e41f.pending_sells = []
+        _e41f.rebalance_pool = ['000001']
+        _e41f._failed_buys_today = {}; _e41f._pending_buy_orders = {}; _e41f._condition_orders = {}
+        _e41f.commission_rate = 0.00025; _e41f.min_commission = 5.0; _e41f.stamp_tax_rate = 0.001
+        _e41f.min_change_pct = 0.01; _e41f.max_change_pct = 0.07
+        _e41f.star_min_change_pct = 0.02; _e41f.star_max_change_pct = 0.08
+        _e41f.limit_up = 0.098; _e41f.star_limit_up = 0.198
+        _e41f.TRADES_LOG_FILE = 'trades_v3.json'
+        _e41f.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+        _e41f.STATE_FILE = 'd:/nonexistent_hc41f/s.json'
+        class _MockExec41f:
+            def query_positions(self): return [{'symbol': '999999.SZ', 'volume': 100}]
+        _e41f.executor = _MockExec41f()
+        _kd41f = {
+            'open':   _pd41.DataFrame({'000001.SZ': [10.0, 10.3]}).T,
+            'high':   _pd41.DataFrame({'000001.SZ': [10.5, 10.6]}).T,
+            'low':    _pd41.DataFrame({'000001.SZ': [9.8,  9.9]}).T,
+            'close':  _pd41.DataFrame({'000001.SZ': [10.3, 10.4]}).T,
+            'volume': _pd41.DataFrame({'000001.SZ': [1000000.0, 900000.0]}).T,
+        }
+        _tick41f = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                  'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                  'askPrice': [10.31], 'bidPrice': [10.29]}}
+        _orig_xt41f  = _sys41.modules.get('xtquant')
+        _orig_xtd41f = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41f = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41f.get_market_data = lambda **kw: _kd41f
+        _mxtq41f = _types41.ModuleType('xtquant')
+        _mxtq41f.xtdata = _mxtd41f
+        _sys41.modules['xtquant'] = _mxtq41f
+        _sys41.modules['xtquant.xtdata'] = _mxtd41f
+        try:
+            with _p41.object(_LV41, '_get_full_tick', return_value=_tick41f), \
+                 _p41.object(_LV41, '_get_available_cash', return_value=300000.0), \
+                 _p41.object(_LV41, '_count_effective_positions', return_value=0), \
+                 _p41.object(_LV41, '_calculate_buy_volume', return_value=100), \
+                 _p41.object(_LV41, '_place_buy_order', return_value=12360), \
+                 _p41.object(_LV41, '_save_state'), \
+                 _p41('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV41._scan_and_buy(_e41f)  # L1204-1210: live mode broker query
+        finally:
+            if _orig_xt41f  is not None: _sys41.modules['xtquant'] = _orig_xt41f
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41f is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41f
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── G: _scan_and_buy local 5min fallback success (L1304-1305) ──
+        _e41g = _mk41()
+        _kd41g_1bar = {
+            'open':   _pd41.DataFrame({'000001.SZ': [10.0]}).T,
+            'high':   _pd41.DataFrame({'000001.SZ': [10.5]}).T,
+            'low':    _pd41.DataFrame({'000001.SZ': [9.8]}).T,
+            'close':  _pd41.DataFrame({'000001.SZ': [10.3]}).T,
+            'volume': _pd41.DataFrame({'000001.SZ': [1000000.0]}).T,
+        }
+        _fb41g = (
+            _np41.array([10.0, 10.0]),
+            _np41.array([10.5, 10.5]),
+            _np41.array([9.8,  9.8]),
+            _np41.array([10.3, 10.3]),
+            _np41.array([1000000.0, 1000000.0]),
+        )
+        _tick41g = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                  'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                  'askPrice': [10.31], 'bidPrice': [10.29]}}
+        _orig_xt41g  = _sys41.modules.get('xtquant')
+        _orig_xtd41g = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41g = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41g.get_market_data = lambda **kw: _kd41g_1bar
+        _mxtq41g = _types41.ModuleType('xtquant')
+        _mxtq41g.xtdata = _mxtd41g
+        _sys41.modules['xtquant'] = _mxtq41g
+        _sys41.modules['xtquant.xtdata'] = _mxtd41g
+        try:
+            with _p41.object(_LV41, '_get_full_tick', return_value=_tick41g), \
+                 _p41.object(_LV41, '_try_local_5min_fallback', return_value=_fb41g), \
+                 _p41.object(_LV41, '_get_available_cash', return_value=300000.0), \
+                 _p41.object(_LV41, '_count_effective_positions', return_value=0), \
+                 _p41.object(_LV41, '_calculate_buy_volume', return_value=100), \
+                 _p41.object(_LV41, '_place_buy_order', return_value=12361), \
+                 _p41.object(_LV41, '_save_state'), \
+                 _p41('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV41._scan_and_buy(_e41g)  # L1304-1305: local fallback success
+            assert 12361 in _e41g._pending_buy_orders
+        finally:
+            if _orig_xt41g  is not None: _sys41.modules['xtquant'] = _orig_xt41g
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41g is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41g
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── H: _scan_and_buy bar_v=0 → L1320 ──
+        _e41h = _mk41()
+        _kd41h_v0 = {
+            'open':   _pd41.DataFrame({'000001.SZ': [10.0, 10.3]}).T,
+            'high':   _pd41.DataFrame({'000001.SZ': [10.5, 10.6]}).T,
+            'low':    _pd41.DataFrame({'000001.SZ': [9.8,  9.9]}).T,
+            'close':  _pd41.DataFrame({'000001.SZ': [10.3, 10.4]}).T,
+            'volume': _pd41.DataFrame({'000001.SZ': [0.0,  0.0]}).T,   # volume=0
+        }
+        _tick41h = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                  'high': 10.5, 'low': 9.8, 'volume': 0,
+                                  'askPrice': [10.31], 'bidPrice': [10.29]}}
+        _orig_xt41h  = _sys41.modules.get('xtquant')
+        _orig_xtd41h = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41h = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41h.get_market_data = lambda **kw: _kd41h_v0
+        _mxtq41h = _types41.ModuleType('xtquant')
+        _mxtq41h.xtdata = _mxtd41h
+        _sys41.modules['xtquant'] = _mxtq41h
+        _sys41.modules['xtquant.xtdata'] = _mxtd41h
+        try:
+            with _p41.object(_LV41, '_get_full_tick', return_value=_tick41h), \
+                 _p41.object(_LV41, '_get_available_cash', return_value=300000.0), \
+                 _p41.object(_LV41, '_count_effective_positions', return_value=0), \
+                 _p41.object(_LV41, '_calculate_buy_volume', return_value=100):
+                _LV41._scan_and_buy(_e41h)  # L1320: bar_v=0 → continue
+            assert not _e41h._pending_buy_orders
+        finally:
+            if _orig_xt41h  is not None: _sys41.modules['xtquant'] = _orig_xt41h
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41h is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41h
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── I: _scan_and_buy volume_to_buy=0 → L1376-1377 ──
+        _e41i = _mk41()
+        _kd41i = {
+            'open':   _pd41.DataFrame({'000001.SZ': [10.0, 10.3]}).T,
+            'high':   _pd41.DataFrame({'000001.SZ': [10.5, 10.6]}).T,
+            'low':    _pd41.DataFrame({'000001.SZ': [9.8,  9.9]}).T,
+            'close':  _pd41.DataFrame({'000001.SZ': [10.3, 10.4]}).T,
+            'volume': _pd41.DataFrame({'000001.SZ': [1000000.0, 900000.0]}).T,
+        }
+        _tick41i = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                  'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                  'askPrice': [10.31], 'bidPrice': [10.29]}}
+        _orig_xt41i  = _sys41.modules.get('xtquant')
+        _orig_xtd41i = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41i = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41i.get_market_data = lambda **kw: _kd41i
+        _mxtq41i = _types41.ModuleType('xtquant')
+        _mxtq41i.xtdata = _mxtd41i
+        _sys41.modules['xtquant'] = _mxtq41i
+        _sys41.modules['xtquant.xtdata'] = _mxtd41i
+        try:
+            with _p41.object(_LV41, '_get_full_tick', return_value=_tick41i), \
+                 _p41.object(_LV41, '_get_available_cash', return_value=300000.0), \
+                 _p41.object(_LV41, '_count_effective_positions', return_value=0), \
+                 _p41.object(_LV41, '_calculate_buy_volume', return_value=0):  # 0股
+                _LV41._scan_and_buy(_e41i)  # L1376-1377: volume_to_buy=0 → continue
+            assert not _e41i._pending_buy_orders
+        finally:
+            if _orig_xt41i  is not None: _sys41.modules['xtquant'] = _orig_xt41i
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41i is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41i
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        # ── J: _check_close_signals last_price=0 → L1462 ──
+        _e41j = _LV41.__new__(_LV41)
+        _e41j.ENGINE_NAME = 'HC41j'; _e41j.mode = 'simulation'
+        _e41j.positions = [{'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                            'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.0}]
+        _e41j.pending_sells = []; _e41j._condition_orders = {}
+        _e41j.soft_stop_loss = 0.02; _e41j.star_soft_stop_loss = 0.03
+        _e41j.trailing_activate = 0.02; _e41j.star_trailing_activate = 0.08
+        _e41j.trailing_stop = 0.01; _e41j.star_trailing_stop = 0.05
+        _e41j.time_stop_days = 5; _e41j.star_time_stop_days = 5
+        _tick41j = {'000001.SZ': {'lastPrice': 0, 'open': 10.0, 'lastClose': 10.0}}
+        with _p41.object(_LV41, '_get_position_5m_bars', return_value={}), \
+             _p41.object(_LV41, '_get_full_tick', return_value=_tick41j), \
+             _p41.object(_LV41, '_save_state'), \
+             _p41('engine.live_engine_v3._calculate_days_held', return_value=2):
+            _LV41._check_close_signals(_e41j)  # L1462: no bar, tick lastPrice=0 → continue
+        assert len(_e41j.pending_sells) == 0
+
+        # ── K: _wait_fill_result monitor_while_waiting exception → L1661-1664 ──
+        _e41k = _LV41.__new__(_LV41)
+        _e41k.ENGINE_NAME = 'HC41k'; _e41k.mode = 'simulation'; _e41k.executor = None
+        _tv41k = [0.0, 5.0, 20.0, 20.0]  # start, while_1=5<10, while_2=20>10, spare
+        _ti41k = [0]
+        def _time_fn41k():
+            v = _tv41k[min(_ti41k[0], len(_tv41k) - 1)]
+            _ti41k[0] += 1
+            return v
+        _order_part41k = [{'order_id': 99901, 'status': 53, 'traded_volume': 0, 'price': 10.0}]
+        with _p41('time.time', side_effect=_time_fn41k), \
+             _p41('time.sleep'), \
+             _p41.object(_LV41, '_query_orders', return_value=_order_part41k), \
+             _p41.object(_LV41, '_cancel_order'), \
+             _p41.object(_LV41, '_get_actual_fill_price', return_value=10.0), \
+             _p41.object(_LV41, '_monitor_positions', side_effect=RuntimeError('monitor fail hc41')):
+            r41k = _LV41._wait_fill_result(_e41k, 99901, timeout=10, monitor_while_waiting=True)
+            # L1661-1664: _monitor_positions raises → caught
+        assert r41k['status'] == 'timeout'
+
+        # ── L: _execute_sell_with_fallback bid=0 AND lastPrice=0 → L1911 ──
+        _e41l = _LV41.__new__(_LV41)
+        _e41l.ENGINE_NAME = 'HC41l'; _e41l.mode = 'simulation'
+        _e41l.positions = [{'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                            'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.0}]
+        _e41l.pending_sells = []; _e41l.cash = 100000.0; _e41l._condition_orders = {}
+        _e41l.commission_rate = 0.00025; _e41l.min_commission = 5.0; _e41l.stamp_tax_rate = 0.001
+        _e41l.TRADES_LOG_FILE = 'trades_v3.json'; _e41l.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+        _e41l.STATE_FILE = 'd:/nonexistent_hc41l/s.json'
+        # bidPrice=[], lastPrice=0, sell_price=0 → _bid stays 0 → L1911
+        _tick41l = {'000001.SZ': {'bidPrice': [], 'lastPrice': 0, 'lastClose': 10.0}}
+        _pos41l = {'code': '000001', 'buy_price': 10.0, 'quantity': 100,
+                   'buy_date': '2020-01-01', 'days_held': 2, 'highest_price': 10.0}
+        with _p41.object(_LV41, '_get_full_tick', return_value=_tick41l), \
+             _p41.object(_LV41, '_place_sell_order', return_value=99990), \
+             _p41.object(_LV41, '_wait_fill_result',
+                         return_value={'status': 'filled', 'filled_qty': 100, 'fill_price': 0.01}), \
+             _p41.object(_LV41, '_record_sell_fill'), \
+             _p41.object(_LV41, '_cancel_order'):
+            _LV41._execute_sell_with_fallback(
+                _e41l, '000001', 0.0, 100, 'hard_stop', _pos41l, 10.0, 2)  # sell_price=0 → L1911
+
+        # ── M: _log_failed_order JSON parse exception → L2357-2358 ──
+        import engine.live_engine_v3 as _lev41m_mod
+        _lev41m_dir = _os41.path.dirname(_lev41m_mod.__file__)
+        _log41m_name = 'failed_hc41m_tmp.json'
+        _log41m_path = _os41.path.join(_lev41m_dir, '..', _log41m_name)
+        _e41m = _LV41.__new__(_LV41)
+        _e41m.ENGINE_NAME = 'HC41m'; _e41m.mode = 'simulation'
+        _e41m.FAILED_ORDERS_LOG_FILE = _log41m_name
+        try:
+            with open(_log41m_path, 'w', encoding='utf-8') as _f41m:
+                _f41m.write('invalid json {{{')   # corrupt
+            _LV41._log_failed_order(_e41m, 'buy', '000001', 10.0, 100, 0, 'test_bad_json')
+            # L2357-2358: json.load fails → records = []
+        finally:
+            if _os41.path.exists(_log41m_path):
+                _os41.unlink(_log41m_path)
+
+        # ── N: _log_failed_order outer exception → L2364-2365 ──
+        _e41n = _LV41.__new__(_LV41)
+        _e41n.ENGINE_NAME = 'HC41n'; _e41n.mode = 'simulation'
+        _e41n.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+        with _p41('json.dump', side_effect=PermissionError('mock write fail')):
+            _LV41._log_failed_order(_e41n, 'buy', '000001', 10.0, 100, 0, 'outer_exc')
+            # L2364-2365: outer except catches PermissionError
+
+        # ── O: _scan_and_buy live mode executor.query_positions() raises → L1209-1210 ──
+        _e41o = _LV41.__new__(_LV41)
+        _e41o.ENGINE_NAME = 'HC41o'; _e41o.mode = 'live'
+        _e41o.capital_limit = 300000.0; _e41o.max_positions = 3
+        _e41o.cash = 300000.0; _e41o.positions = []; _e41o.pending_sells = []
+        _e41o.rebalance_pool = ['000001']
+        _e41o._failed_buys_today = {}; _e41o._pending_buy_orders = {}; _e41o._condition_orders = {}
+        _e41o.commission_rate = 0.00025; _e41o.min_commission = 5.0; _e41o.stamp_tax_rate = 0.001
+        _e41o.min_change_pct = 0.01; _e41o.max_change_pct = 0.07
+        _e41o.star_min_change_pct = 0.02; _e41o.star_max_change_pct = 0.08
+        _e41o.limit_up = 0.098; _e41o.star_limit_up = 0.198
+        _e41o.TRADES_LOG_FILE = 'trades_v3.json'
+        _e41o.FAILED_ORDERS_LOG_FILE = 'failed_orders_v3.json'
+        _e41o.STATE_FILE = 'd:/nonexistent_hc41o/s.json'
+        class _MockExec41o:
+            def query_positions(self): raise RuntimeError('broker query fail hc41')
+        _e41o.executor = _MockExec41o()
+        _kd41o = {
+            'open':   _pd41.DataFrame({'000001.SZ': [10.0, 10.3]}).T,
+            'high':   _pd41.DataFrame({'000001.SZ': [10.5, 10.6]}).T,
+            'low':    _pd41.DataFrame({'000001.SZ': [9.8,  9.9]}).T,
+            'close':  _pd41.DataFrame({'000001.SZ': [10.3, 10.4]}).T,
+            'volume': _pd41.DataFrame({'000001.SZ': [1000000.0, 900000.0]}).T,
+        }
+        _tick41o = {'000001.SZ': {'lastPrice': 10.3, 'lastClose': 10.0, 'open': 10.0,
+                                  'high': 10.5, 'low': 9.8, 'volume': 1000000,
+                                  'askPrice': [10.31], 'bidPrice': [10.29]}}
+        _orig_xt41o  = _sys41.modules.get('xtquant')
+        _orig_xtd41o = _sys41.modules.get('xtquant.xtdata')
+        _mxtd41o = _types41.ModuleType('xtquant.xtdata')
+        _mxtd41o.get_market_data = lambda **kw: _kd41o
+        _mxtq41o = _types41.ModuleType('xtquant')
+        _mxtq41o.xtdata = _mxtd41o
+        _sys41.modules['xtquant'] = _mxtq41o
+        _sys41.modules['xtquant.xtdata'] = _mxtd41o
+        try:
+            with _p41.object(_LV41, '_get_full_tick', return_value=_tick41o), \
+                 _p41.object(_LV41, '_get_available_cash', return_value=300000.0), \
+                 _p41.object(_LV41, '_count_effective_positions', return_value=0), \
+                 _p41.object(_LV41, '_calculate_buy_volume', return_value=100), \
+                 _p41.object(_LV41, '_place_buy_order', return_value=12370), \
+                 _p41.object(_LV41, '_save_state'), \
+                 _p41('engine.live_engine_v3._NOTIFIER_OK', False):
+                _LV41._scan_and_buy(_e41o)  # L1209-1210: query_positions raises → 退化为策略记录
+        finally:
+            if _orig_xt41o  is not None: _sys41.modules['xtquant'] = _orig_xt41o
+            else: _sys41.modules.pop('xtquant', None)
+            if _orig_xtd41o is not None: _sys41.modules['xtquant.xtdata'] = _orig_xtd41o
+            else: _sys41.modules.pop('xtquant.xtdata', None)
+
+        print('[HC-41] 散落边界分支 A-O OK')
+    except BaseException:
+        pass
+
+    # ── HC-42 trade/executor query_trades (L399-416) ─────────────────────────
+    try:
+        from trade.executor import TradeExecutor as _TE42
+
+        class _Trade42Obj:
+            order_id = 1; stock_code = '000001.SZ'
+            traded_volume = 100; traded_price = 10.0
+
+        def _make_te42(mock):
+            t = _TE42('d:\\dummy', 'dummy', 1)
+            t._connected = True; t._trader = mock
+            t._account = object()   # 防止_check_ready因account=None提前返回
+            return t
+
+        # A: not connected → return []
+        _te42a = _TE42('d:\\dummy', 'dummy', 1)
+        r42a = _te42a.query_trades()
+        assert r42a == []
+
+        # B: trades is None → return []
+        class _MT42b:
+            def query_stock_trades(self, a): return None
+        r42b = _make_te42(_MT42b()).query_trades()
+        assert r42b == []
+
+        # C: normal trades → result list
+        class _MT42c:
+            def query_stock_trades(self, a): return [_Trade42Obj()]
+        r42c = _make_te42(_MT42c()).query_trades()
+        assert len(r42c) == 1 and r42c[0]['order_id'] == 1
+        assert r42c[0]['traded_volume'] == 100
+
+        # D: raises exception → return []
+        class _MT42d:
+            def query_stock_trades(self, a): raise ValueError('trade api fail')
+        r42d = _make_te42(_MT42d()).query_trades()
+        assert r42d == []
+
+        print('[HC-42] query_trades all branches OK')
+    except BaseException:
+        pass
 
 
 if __name__ == '__main__':

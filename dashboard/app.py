@@ -382,14 +382,14 @@ def create_app():
             s['name'] = _get_stock_name(c)
 
         return jsonify({
-            'cash': round(cash, 2),
-            'total_value': round(realtime_total, 2),
+            'cash': round(cash, 3),
+            'total_value': round(realtime_total, 3),
             'initial_capital': initial_capital,
             'positions': positions,
             'pending_sells': pending_sells,
             'last_update': state.get('last_update', state.get('update_time', '')),
-            'profit': round(profit, 2),
-            'profit_pct': round(profit_pct, 2)
+            'profit': round(profit, 3),
+            'profit_pct': round(profit_pct, 3)
         })
 
     @app.route('/api/trades')
@@ -540,15 +540,20 @@ def create_app():
                     last_price = tick.get('lastPrice') or tick.get('last_price') or 0
                     pre_close  = tick.get('lastClose') or tick.get('pre_close') or tick.get('preClose') or 0
                     open_price = tick.get('open') or 0
+                    volume     = tick.get('volume') or 0
                     if pre_close and pre_close > 0:
                         change_pct = (last_price - pre_close) / pre_close * 100
                     else:
                         change_pct = 0.0
-                    is_positive = last_price > open_price if open_price > 0 else False
+                    is_positive = last_price > open_price if open_price > 0 else None
                     limit_pct = limit_up * 100
-                    meets = (change_pct > threshold * 100) and is_positive and (change_pct < limit_pct)
+                    meets = (change_pct > threshold * 100) and (is_positive is True) and (change_pct < limit_pct)
+                    # 未开盘判断：volume=0（最可靠）或 open=0 均视为未开盘
+                    not_opened = (volume == 0 or open_price <= 0 or last_price <= 0)
                     # 状态判断
-                    if change_pct >= limit_pct:
+                    if not_opened:
+                        status = '待开市'
+                    elif change_pct >= limit_pct:
                         status = '涨停'
                     elif not is_positive:
                         status = '收阴'

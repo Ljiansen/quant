@@ -1,17 +1,107 @@
 # -*- coding: utf-8 -*-
 """
-紧急初始化调仓池脚本
-使用本地数据（D:/daily_data）构建当前调仓池
+初始化 V3 调仓池脚本
+先增量更新日线数据，再构建调仓池
 输出格式与 state_v3_rebalance.json 完全一致
+
+用法：
+  python init_rebalance_pool.py              # 先更新日线，再建池（默认）
+  python init_rebalance_pool.py --skip-update # 跳过日线更新，直接建池
+  python init_rebalance_pool.py --strategy a  # 指定策略（ba/a/b）
 """
 
 import json
 import os
 import sys
+import subprocess
+import glob
 import pandas as pd
 
 sys.path.insert(0, 'd:/miniqmt_quant')
 import config
+
+
+def run_daily_data_update():
+    """调用 update_daily_data.py --force 更新日线数据，返回是否成功"""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'update_daily_data.py')
+    print("\n" + "=" * 60)
+    print("[前置步骤] 更新本地日线数据（update_daily_data.py --force）")
+    print("=" * 60)
+    try:
+        ret = subprocess.run(
+            [sys.executable, script, '--force'],
+            check=False
+        )
+        if ret.returncode == 0:
+            print("[前置步骤] 日线数据更新完成 ✓")
+            return True
+        else:
+            print(f"[前置步骤] 日线数据更新异常（returncode={ret.returncode}），继续用已有数据建池")
+            return False
+    except Exception as e:
+        print(f"[前置步骤] 调用更新脚本失败: {e}，继续用已有数据建池")
+        return False
+
+
+def download_pool_5min_today(pool: list, output_dir: str, date_str: str):
+    """下载调仓池今日5分钟K线（前复权），存入 output_dir/{code}_{YYYYMMDD}.csv
+
+    每张文件列：datetime,open,high,low,close,volume,amount
+    失败的股票静默跳过，不中断整个建池流程。
+    """
+    try:
+        import baostock as bs
+    except ImportError:
+        print("[5min预缓存] baostock 未安装，跳过下载")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    date_fmt = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"  # YYYYMMDD → YYYY-MM-DD
+
+    print(f"\n[建池后置] 下载调仓池今日({date_fmt})5分钟K线，共{len(pool)}只，存入: {output_dir}")
+    bs_ret = bs.login()
+    if bs_ret.error_code != '0':
+        print(f"[建池后置] baostock登录失败({bs_ret.error_msg})，跳过下载")
+        return
+
+    ok, fail, skip = 0, 0, 0
+    for code in pool:
+        bs_code = f"sh.{code}" if code.startswith('6') else f"sz.{code}"
+        out_file = os.path.join(output_dir, f"{code}_{date_str}.csv")
+        try:
+            rs = bs.query_history_k_data_plus(
+                code=bs_code,
+                fields='time,open,high,low,close,volume,amount',
+                start_date=date_fmt,
+                end_date=date_fmt,
+                frequency='5',
+                adjustflag='2'
+            )
+            rows = []
+            while rs.error_code == '0' and rs.next():
+                rows.append(rs.get_row_data())
+
+            if not rows:
+                skip += 1
+                continue
+
+            df = pd.DataFrame(rows, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+            # baostock time 格式: '20260506093000000' → datetime
+            df['datetime'] = pd.to_datetime(df['time'].str[:14], format='%Y%m%d%H%M%S')
+            df = df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'amount']]
+            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.to_csv(out_file, index=False)
+            ok += 1
+        except Exception as e:
+            print(f"[建池后置] {code} 下载失败: {e}")
+            fail += 1
+
+    bs.logout()
+    print(f"[建池后置] 5分钟预缓存完成: 成功={ok} 无数据={skip} 失败={fail}")
+    if ok + skip == len(pool) and fail == 0:
+        print(f"[建池后置] 注意: baostock 今日数据可能尚未发布（15:30后才平稳）")
+
 
 
 def build_trading_calendar(data_dir='D:/daily_data'):
@@ -162,6 +252,26 @@ def main(strategy: str = 'ba'):
     print(f"  本地股票总数: {len(all_codes)}")
     print(f"  符合板块规则: {len(filtered_codes)}")
 
+    # ST 过滤：通过 xtquant 获取股票名称，排除名称含 ST 的股票
+    try:
+        from xtquant import xtdata as _xtd
+        st_excluded = []
+        non_st_codes = []
+        for code in filtered_codes:
+            suffix = '.SH' if code.startswith('6') else '.SZ'
+            detail = _xtd.get_instrument_detail(code + suffix)
+            if detail:
+                name = detail.get('InstrumentName', '')
+                if 'ST' in name.upper():
+                    st_excluded.append(code)
+                    continue
+            non_st_codes.append(code)
+        print(f"  ST过滤排除: {len(st_excluded)} 只（{', '.join(st_excluded[:10])}{'...' if len(st_excluded)>10 else ''}）")
+        filtered_codes = non_st_codes
+    except Exception as _e:
+        print(f"  [警告] ST过滤失败({_e})，跳过ST过滤")
+    print(f"  过滤后可用: {len(filtered_codes)} 只")
+
     # 3. 逐只读取数据，计算 B+A 指标
     print("\n[3/4] 读取数据并计算 B+A 指标...")
     lookback_dates_set = set(trading_dates[lookback_start_idx:cur_idx + 1])
@@ -264,6 +374,15 @@ def main(strategy: str = 'ba'):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    # 建池完成后立即存历史快照（以 rebalance_date 命名，可跨期追溯）
+    import os as _os
+    _snap_dir = 'd:/miniqmt_quant/pool_snapshots'
+    _os.makedirs(_snap_dir, exist_ok=True)
+    _snap_path = _os.path.join(_snap_dir, f'{rebalance_date_ymd}_pool.json')
+    with open(_snap_path, 'w', encoding='utf-8') as _sf:
+        json.dump(output, _sf, ensure_ascii=False, indent=2)
+    print(f"  快照已保存: {_snap_path}")
+
     print(f"  文件已保存: {output_path}")
     print(f"  调仓池大小: {len(pool)}")
     print("\n" + "=" * 60)
@@ -278,6 +397,37 @@ def main(strategy: str = 'ba'):
         print(f"  {i:2d}. {code}  信号质量={int(row['quality_score'])}天  "
               f"收盘={row['last_close']:.2f}  MA20={row['ma20']:.2f}")
 
+    # 建池后置：下载今日5分钟K线到预缓存目录
+    next_pool_dir = getattr(config, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
+
+    # ── 步骤A：保存旧调仓池今日5min数据（回测存档）──────────────────────────────
+    # 读取即将被覆盖的旧池子，下载它们今天的5分钟K线
+    # 与新池子重叠的股票会被覆盖写入，内容相同，无影响
+    _old_pool = []
+    try:
+        if os.path.exists(output_path):
+            with open(output_path, 'r', encoding='utf-8') as _f:
+                _old_pool = json.load(_f).get('pool', [])
+    except Exception as _e:
+        print(f"[建池后置] 读取旧调仓池失败({_e})，跳过旧池5min存档")
+    if _old_pool:
+        _old_only = [c for c in _old_pool if c not in pool]
+        print(f"[建池后置] 旧调仓池{len(_old_pool)}只，其中{len(_old_only)}只不在新池（退出股票），存档其今日5min数据")
+        download_pool_5min_today(_old_pool, next_pool_dir, rebalance_date_ymd)
+
+    # ── 步骤B：下载新调仓池今日5min数据（供次日实盘引擎兜底）────────────────────
+    # 供次日实盘引擎对新入池股票（miniQMT无历史bar）的兜底使用
+    download_pool_5min_today(pool, next_pool_dir, rebalance_date_ymd)
+
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument('--strategy',    default='ba', help='选股策略: ba/a/b')
+    _ap.add_argument('--skip-update', action='store_true', help='跳过日线数据更新步骤')
+    _args = _ap.parse_args()
+
+    if not _args.skip_update:
+        run_daily_data_update()
+
+    main(strategy=_args.strategy)

@@ -77,3 +77,10 @@ V3_STAR_LIMIT_UP = 0.198        # 科创板涨停保护19.8%
 V3_MAX_CHANGE_PCT = 0.07        # 主板最大涨幅（超过此値视为追高，不买），回测最佳参数
 V3_STAR_MAX_CHANGE_PCT = 0.08   # 科创/创业板最大涨幅（超过此值视为追高，不买）
 V3_PREV_BAR_UP = True              # 买入时要求上一根5分钟K线非阴线（close >= open）
+
+# 明日调仓池5分钟K线预缓存目录（每日收盘后建池时下载，供次日实盘引擎兜底使用）
+V3_NEXT_POOL_5MIN_DIR = 'd:/miniqmt_quant/5min_next_pool'
+
+# 实盘下单实时价智能路由参数
+V3_LIVE_BUY_SLIP_MAX  = 0.003   # 买入：实时卖一价超过bar_c的最大可接受溢价（超出则挂bar_c等回落）
+V3_LIVE_SELL_SLIP_MAX = 0.003   # 卖出：实时买一价低于止损价的最大可接受折价（超出时记警告，仍用买一价优先成交）

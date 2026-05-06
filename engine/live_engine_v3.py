@@ -32,6 +32,7 @@ try:
     from utils.notifier import notify_buy as _notify_buy
     from utils.notifier import notify_sell as _notify_sell
     from utils.notifier import notify_pending_sell as _notify_pending_sell
+    from utils.notifier import notify_system as _notify_system
     _NOTIFIER_OK = True
 except Exception:
     _NOTIFIER_OK = False
@@ -450,6 +451,12 @@ class LiveEngineV3:
         self._daily_filter_date = state.get('_daily_filter_date')
         self._daily_filter_cache = state.get('_daily_filter_cache', [])
 
+        # 恢复非阻塞 pending 买单（order_id存为字符串，转回int）
+        _raw_pending = state.get('_pending_buy_orders', {})
+        self._pending_buy_orders = {int(k): v for k, v in _raw_pending.items()}
+        if self._pending_buy_orders:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 恢复 pending 买单 {len(self._pending_buy_orders)} 笔")
+
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 恢复持仓 {len(self.positions)} 只，"
               f"现金 {self.cash:.2f}，pending_sells {len(self.pending_sells)} 条")
 
@@ -711,12 +718,123 @@ class LiveEngineV3:
                 self._rebalance_pool_mtime = os.path.getmtime(self.REBALANCE_FILE)
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 调仓池加载成功: {len(self.rebalance_pool)} 只，"
                       f"调仓日={rebalance_date}")
+
+                # ── 预缓存覆盖检查：哪些股票有/无 5min_next_pool 本地文件 ──────────────
+                try:
+                    import glob as _glob
+                    _cache_dir = getattr(config, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
+                    _with_cache    = [c for c in self.rebalance_pool
+                                      if _glob.glob(os.path.join(_cache_dir, f"{c}_*.csv"))]
+                    _without_cache = [c for c in self.rebalance_pool
+                                      if not _glob.glob(os.path.join(_cache_dir, f"{c}_*.csv"))]
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 5分钟预缓存覆盖: "
+                          f"有文件={len(_with_cache)} 只，无文件={len(_without_cache)} 只")
+                    if _without_cache:
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] 以下股票无5分钟预缓存，"
+                              f"盘中将依赖 miniQMT 订阅实时填充（新入池股票首日可能出现K线不足）: "
+                              f"{_without_cache}")
+                    else:
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 所有调仓池股票均有5分钟预缓存，兜底路径就绪")
+                except Exception as _ce:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 预缓存覆盖检查失败（不影响主流程）: {_ce}")
+
+                # 加载完成后立即订阅5分钟K线，确保 get_market_data 有本地缓存
+                self._subscribe_5m_pool()
             except Exception as e:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 加载调仓池失败: {e}，使用空池")
                 self.rebalance_pool = []
         else:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 调仓池文件不存在: {self.REBALANCE_FILE}，使用空池")
             self.rebalance_pool = []
+
+    def _try_local_5min_fallback(self, code: str):
+        """从 5min_next_pool 目录读取最新的{code}_*.csv，返回最后2根bar的各字段数组
+
+        返回格式: (opens, highs, lows, closes, vols) 各为长度≥2的 numpy array
+        任何失败情况返回 None（调用方读到 None 则跳过该股票）
+        """
+        import glob
+        import numpy as np
+        import pandas as pd
+        cache_dir = getattr(config, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
+        try:
+            pattern = os.path.join(cache_dir, f"{code}_*.csv")
+            files = sorted(glob.glob(pattern))
+            if not files:
+                return None
+            latest = files[-1]  # 按文件名升序，取最新的
+            df = pd.read_csv(latest)
+            if df.empty or len(df) < 1:
+                return None
+            tail = df.tail(2)
+            opens  = tail['open'].astype(float).values
+            highs  = tail['high'].astype(float).values
+            lows   = tail['low'].astype(float).values
+            closes = tail['close'].astype(float).values
+            vols   = tail['volume'].astype(float).values
+            # 不足两根时补齐（用第一根复制）
+            while len(closes) < 2:
+                opens  = np.concatenate([[opens[0]],  opens])
+                highs  = np.concatenate([[highs[0]],  highs])
+                lows   = np.concatenate([[lows[0]],   lows])
+                closes = np.concatenate([[closes[0]], closes])
+                vols   = np.concatenate([[vols[0]],   vols])
+            return opens, highs, lows, closes, vols
+        except Exception as _fe:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [{code}] 本地5分钟兜底读取失败: {_fe}")
+            return None
+
+    def _subscribe_5m_pool(self):
+        """订阅调仓池 + 当前持仓股的5分钟K线实时推送
+
+        调用后 get_market_data(period='5m', count=N) 才能正常返回数据。
+        流程：先 download_history_data 确保 datadir 有历史数据，
+              再 subscribe_quote(count=3) 预载入内存缓存。
+        对新入池股票（datadir 无历史数据）尤为关键：
+          若跳过 download 直接 subscribe，count=3 预取为空，
+          9:35 首次扫描时 get_market_data 返回空导致买入信号失效。
+        持仓股也加入订阅，防止非调仓池历史持仓在卖出监控时无5m缓存。
+        """
+        pool_codes = [_format_symbol(c) for c in self.rebalance_pool]
+        pos_codes  = [_format_symbol(_strip_suffix(p.get('code', p.get('symbol', ''))))
+                      for p in self.positions]
+        symbols = list(dict.fromkeys(pool_codes + pos_codes))  # 去重保序
+        if not symbols:
+            return
+
+        ok_cnt, fail_cnt = 0, 0
+        dl_ok, dl_fail = 0, 0
+        try:
+            from xtquant import xtdata as _xtd_sub
+
+            # ── 第一步：批量下载历史数据到 datadir（新入池股票首次必须） ──────────
+            # download_history_data 对已有数据只做增量补充，幂等安全
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 预下载5分钟历史数据（共{len(symbols)}只）...")
+            for sym in symbols:
+                try:
+                    _xtd_sub.download_history_data(sym, period='5m', start_time='', end_time='')
+                    dl_ok += 1
+                except Exception as _de:
+                    dl_fail += 1
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] {sym} 历史下载失败: {_de}")
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 历史数据下载完成: 成功{dl_ok} 失败{dl_fail}")
+
+            # ── 第二步：订阅实时推送（此时 datadir 已有数据，count=3 可正常预取） ──
+            for sym in symbols:
+                try:
+                    _xtd_sub.subscribe_quote(sym, period='5m', count=3)
+                    ok_cnt += 1
+                except Exception:
+                    fail_cnt += 1
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 5分钟K线订阅完成: "
+                  f"成功 {ok_cnt} 只，失败 {fail_cnt} 只（调仓池{len(pool_codes)}+持仓{len(pos_codes)}只）")
+        except Exception as e:
+            _msg = f"订阅5分钟K线异常({e})，K线买入/卖出信号将无法获取数据"
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] {_msg}")
+            try:
+                _notify_system(title="⚠️ 5分钟K线订阅失败", body=_msg, level='error')
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # 集合竞价卖出（9:15 执行）
@@ -897,18 +1015,64 @@ class LiveEngineV3:
     # ------------------------------------------------------------------
     # 盘中持仓监控（9:30~15:00）
     # ------------------------------------------------------------------
+    def _get_position_5m_bars(self) -> dict:
+        """批量获取持仓股最新已完成5分钟bar（count=2 中的 [-2]）
+
+        与回测对齐：止损/止盈触发用 bar['low']，最高价更新用 bar['high']，
+        卖出价用 max(止损价, bar['open'])。
+
+        Returns:
+            {code_bare: {'open': float, 'high': float, 'low': float,
+                         'close': float, 'volume': float}}
+        """
+        if not self.positions:
+            return {}
+        symbols = list(dict.fromkeys(
+            _format_symbol(_strip_suffix(p.get('code', p.get('symbol', ''))))
+            for p in self.positions
+        ))
+        try:
+            from xtquant import xtdata as _xtd_pos
+            kd = _xtd_pos.get_market_data(
+                field_list=['open', 'high', 'low', 'close', 'volume'],
+                stock_list=symbols, period='5m', count=2
+            )
+            result = {}
+            for sym in symbols:
+                code = _strip_suffix(sym)
+                bar = {}
+                for field in ('open', 'high', 'low', 'close', 'volume'):
+                    df = kd.get(field)
+                    if df is None or not hasattr(df, 'loc') or sym not in df.index:
+                        continue
+                    vals = df.loc[sym].values
+                    if len(vals) < 2:
+                        continue
+                    bar[field] = float(vals[-2])
+                if len(bar) == 5 and bar.get('volume', 0) > 0:
+                    result[code] = bar
+            return result
+        except Exception as _e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 持仓5分钟bar获取失败({_e})，使用tick兜底")
+            return {}
+
     def _monitor_positions(self):
         """检查持仓的硬止损/止盈条件
 
-        流程：
-        1. get_full_tick 批量获取持仓实时快照
-        2. 检查每只持仓的止损/止盈条件
-        3. 触发 → 限价卖出 → 成交后移除持仓
+        流程（与回测对齐，使用5分钟K线）：
+        1. 批量获取持仓股最新已完成5分钟bar
+        2. 用 bar['low'] 判断是否触发硬止损/移动止盈
+        3. 用 bar['high'] 更新持仓历史最高价
+        4. 卖出价 = max(止损价, bar['open'])（无5m bar时回退到tick lastPrice）
+        5. 触发 → 限价卖出 → 成交后移除持仓
         """
         if not self.positions:
             return
 
         codes = [_format_symbol(_strip_suffix(p.get('code', p.get('symbol', '')))) for p in self.positions]
+        # 5分钟bar数据（止损/止盈触发主要数据源，与回测对齐）
+        pos_bars = self._get_position_5m_bars()
+        # tick 仍保留：bar不可用时兜底，以及条件单更新
         ticks = self._get_full_tick(codes)
 
         # 已在 pending_sells 中的代码，正在等待次日竞价卖出，跳过防止重复下单
@@ -921,16 +1085,24 @@ class LiveEngineV3:
                 continue
             symbol = _format_symbol(code)
             tick = ticks.get(symbol)
-            if not tick:
-                continue
-
-            last_price = tick.get('lastPrice', 0)
-            if last_price <= 0:
-                continue
 
             buy_price = pos.get('buy_price', 0)
             if buy_price <= 0:
                 continue
+
+            # 获取5分钟bar；无bar则用tick lastPrice兜底
+            bar_data = pos_bars.get(code)
+            if bar_data:
+                bar_low  = bar_data['low']
+                bar_high = bar_data['high']
+                bar_open = bar_data['open']
+                chk_price = bar_low     # 止损触发用 bar low（与回测对齐）
+            else:
+                last_price = tick.get('lastPrice', 0) if tick else 0
+                if last_price <= 0:
+                    continue
+                bar_low = bar_high = bar_open = last_price
+                chk_price = last_price  # 兜底：tick lastPrice
 
             # 判断是否科创板/创业板
             is_star = self._is_star(code)
@@ -940,10 +1112,10 @@ class LiveEngineV3:
 
             hard_stop_price = buy_price * (1 - hard_sl)
 
-            # 每 tick 更新持仓历史最高价
+            # 用 bar['high'] 更新持仓历史最高价（与回测对齐）
             highest_price = pos.get('highest_price', buy_price)
-            if last_price > highest_price:
-                highest_price = last_price
+            if bar_high > highest_price:
+                highest_price = bar_high
                 pos['highest_price'] = highest_price
                 # 最高价上升时，若移动止盈已激活，更新条件单触发价至新的回撤线
                 if highest_price >= buy_price * (1 + trail_act):
@@ -956,26 +1128,31 @@ class LiveEngineV3:
                 continue
 
             should_sell = False
-            sell_price = last_price
+            sell_price = chk_price
             sell_type = None
 
-            # 1. 硬止损（最高优先级）
-            if last_price <= hard_stop_price:
+            # 1. 硬止损（最高优先级）：用 bar['low'] 判断触发，卖出价=max(止损价, bar_open)
+            if chk_price <= hard_stop_price:
                 should_sell = True
-                sell_price = hard_stop_price
+                sell_price = max(hard_stop_price, bar_open)
                 sell_type = 'hard_stop'
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 触发硬止损: {code} "
-                      f"现价={last_price:.3f} 止损价={hard_stop_price:.3f}")
+                      f"bar_low={bar_low:.3f} 止损价={hard_stop_price:.3f} 卖出价={sell_price:.3f}")
 
-            # 2. 移动止盈：激活后从最高价回撤触发
+            # 2. 移动止盈：激活后 bar['low'] 触达回撤线触发
+            # 卖出参考价：正常情况 bar_open >= trail_trigger，两者等价取 bar_open；
+            # 跳空低开时 bar_open < trail_trigger，trail_trigger 价格不可达，强制用 bar_open
+            # （路由层无论如何都会用实时买一价下单，sell_price 仅作折价计算的参考基准）
             elif highest_price >= buy_price * (1 + trail_act):
                 trail_trigger = highest_price * (1 - trail_pct)
-                if last_price <= trail_trigger:
+                if chk_price <= trail_trigger:
                     should_sell = True
-                    sell_price = trail_trigger
+                    sell_price = bar_open  # 用真实开盘价作参考，跳空低开时语义正确
                     sell_type = 'trailing_stop'
                     print(f"[{_now_str()}] [{self.ENGINE_NAME}] 触发移动止盈: {code} "
-                          f"最高价={highest_price:.3f} 回撤价={trail_trigger:.3f} 现价={last_price:.3f}")
+                          f"最高价={highest_price:.3f} 回撤价={trail_trigger:.3f} "
+                          f"bar_low={bar_low:.3f} bar_open={bar_open:.3f} "
+                          f"{'跳空低开' if bar_open < trail_trigger else '正常触发'}")
 
             if should_sell:
                 quantity = pos.get('quantity', 0)
@@ -1009,6 +1186,9 @@ class LiveEngineV3:
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 开始扫描买入，"
               f"调仓池={len(self.rebalance_pool)}只，持仓={len(self.positions)}/{self.max_positions}")
 
+        # 先检查上一轮挂出的pending买单状态（非阻塞）
+        self._check_pending_buy_orders()
+
         if not self.rebalance_pool:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 调仓池为空，跳过")
             return
@@ -1031,8 +1211,10 @@ class LiveEngineV3:
                 for _rp in _real_pos:
                     if _rp.get('volume', 0) > 0:
                         held_codes.add(_strip_suffix(_rp['symbol']))
-            except Exception:
-                pass  # 查询失败时退化为仅使用策略记录
+            except Exception as _qp_err:
+                # 查询失败时退化为仅使用策略记录，但打印告警，防止手动买入的股票被重复下单
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [警告] broker持仓查询失败({_qp_err})，"
+                      f"已退化为仅使用策略记录排重，手动持仓可能被重复下单")
 
         # 当日可交易池（二次过滤）
         tradable_pool = self._get_tradable_pool(held_codes)
@@ -1042,9 +1224,47 @@ class LiveEngineV3:
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 候选池{len(tradable_pool)}只，可用资金={available_cash:.0f}")
 
-        # 批量获取行情快照
+        # 批量获取行情快照（仅用于 pre_close）
         symbols = [_format_symbol(c) for c in tradable_pool]
         ticks = self._get_full_tick(symbols)
+
+        # 批量获取最近2根5分钟K线（[-2]=最新已完成Bar，[-1]=当前成型Bar）
+        # 与回测逻辑对齐：以已完成K线的close作为信号依据和挂单价
+        # 注：引擎首次扫描在9:35:30左右，距9:30-9:35收盘≥30s，不存在取不到数据的问题
+        # get_market_data 返回的是 pandas DataFrame：index=股票代码, columns=时间戳
+        # 需用 df.loc[symbol].values 提取每只股票的时序数组
+        try:
+            from xtquant import xtdata as _xtd_kd
+            _kd = _xtd_kd.get_market_data(
+                field_list=['open', 'high', 'low', 'close', 'volume'],
+                stock_list=symbols,
+                period='5m',
+                count=2
+            )
+
+            def _kd_get(field):
+                """DataFrame.loc[股票] 提取，不存在则返回空列表"""
+                df = _kd.get(field)
+                if df is None or not hasattr(df, 'loc'):
+                    return {}
+                # 转换为 {symbol: numpy_array}
+                return {sym: df.loc[sym].values
+                        for sym in df.index
+                        if sym in df.index}
+
+            _kd_opens  = _kd_get('open')
+            _kd_highs  = _kd_get('high')
+            _kd_lows   = _kd_get('low')
+            _kd_closes = _kd_get('close')
+            _kd_vols   = _kd_get('volume')
+
+            n_valid = sum(1 for v in _kd_closes.values() if len(v) >= 2)
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] K线数据: "
+                  f"共{len(_kd_closes)}只返回，其中{n_valid}只数据充足(>=2根bar)")
+        except Exception as _ke:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 5分钟K线批量获取失败({_ke})，本次跳过")
+            import traceback; traceback.print_exc()
+            return
 
         today_str = date.today().strftime('%Y-%m-%d')
 
@@ -1053,9 +1273,14 @@ class LiveEngineV3:
         if failed_today:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 今日已失败代码跳过: {failed_today}")
 
+        # pending买单数量（非阻塞挂单，已占槽但未确认成交）
+        pending_count = len(self._pending_buy_orders)
+        if pending_count > 0:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 当前pending买单={pending_count}笔，已占槽{pending_count}个")
+
         for code in tradable_pool:
-            # 持仓已满（按有效仓位计算），停止
-            if self._count_effective_positions() >= self.max_positions:
+            # 持仓已满（含待确认pending买单占位），停止
+            if self._count_effective_positions() + pending_count >= self.max_positions:
                 break
 
             # 今日已尝试失败，跳过
@@ -1063,172 +1288,144 @@ class LiveEngineV3:
                 continue
 
             symbol = _format_symbol(code)
+
+            # 从 tick 获取昨日收盘价（pre_close），用于涨幅计算
             tick = ticks.get(symbol)
-            if not tick:
+            pre_close = 0
+            if tick:
+                pre_close = tick.get('lastClose', 0) or tick.get('preClose', 0)
+            if pre_close <= 0:
                 continue
 
-            last_price = tick.get('lastPrice', 0)
-            pre_close = tick.get('lastClose', 0) or tick.get('preClose', 0)
-            open_price = tick.get('open', 0)
-            volume = tick.get('volume', 0)
-            high_price = tick.get('high', 0)
+            # 取最新已完成的 5 分钟 K 线（count=2 中的 [-2]；[-1] 为当前成型 Bar）
+            _bar_opens  = _kd_opens.get(symbol,  [])
+            _bar_highs  = _kd_highs.get(symbol,  [])
+            _bar_lows   = _kd_lows.get(symbol,   [])
+            _bar_closes = _kd_closes.get(symbol, [])
+            _bar_vols   = _kd_vols.get(symbol,   [])
 
-            # 跳过停牌/无效数据
-            if last_price <= 0 or pre_close <= 0 or volume == 0:
+            if len(_bar_closes) < 2:
+                # 尝试本地5分钟兜底（新入池股票 miniQMT 无历史bar时使用）
+                _fb = self._try_local_5min_fallback(code)
+                if _fb is not None:
+                    _bar_opens, _bar_highs, _bar_lows, _bar_closes, _bar_vols = _fb
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
+                          f"miniQMT无历史bar，已用本地5分钟预缓存兜底")
+                else:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
+                          f"K线数据不足(bars={len(_bar_closes)})且无本地兜底，跳过")
+                    continue
+
+            bar_o = float(_bar_opens[-2])
+            bar_h = float(_bar_highs[-2])
+            bar_l = float(_bar_lows[-2])
+            bar_c = float(_bar_closes[-2])
+            bar_v = float(_bar_vols[-2])
+
+            # 无效K线（停牌/无数据）
+            if bar_v <= 0 or bar_c <= 0:
                 continue
 
-            # 排除ST股票（暂时注释：建池阶段未过滤，此处保留逻辑但不执行）
-            # try:
-            #     from xtquant import xtdata
-            #     detail = xtdata.get_instrument_detail(symbol)
-            #     if detail:
-            #         name = detail.get('InstrumentName', '')
-            #         if 'ST' in name:
-            #             continue
-            # except Exception:
-            #     pass
-
-            # 检查买入信号
             bar = {
-                'open': open_price,
-                'high': high_price,
-                'low': tick.get('low', 0),
-                'close': last_price,
-                'volume': volume,
-                'amount': tick.get('amount', 0),
+                'open':   bar_o,
+                'high':   bar_h,
+                'low':    bar_l,
+                'close':  bar_c,
+                'volume': bar_v,
+                'amount': bar_c * bar_v,
             }
-            change_pct = (last_price - pre_close) / pre_close if pre_close > 0 else 0
-            is_positive = last_price > open_price if open_price > 0 else False
+            change_pct = (bar_c - pre_close) / pre_close if pre_close > 0 else 0
 
-            # 前5分钟K线非阴线过滤（close >= open）
-            if self.prev_bar_up:
-                try:
-                    from xtquant import xtdata as _xtd
-                    _hist = _xtd.get_market_data(
-                        field_list=['open', 'close', 'volume'],
-                        stock_list=[symbol],
-                        period='5m',
-                        count=2
-                    )
-                    _pb_opens  = _hist.get('open',  {}).get(symbol, [])
-                    _pb_closes = _hist.get('close', {}).get(symbol, [])
-                    if len(_pb_opens) >= 2 and len(_pb_closes) >= 2:
-                        _pb_o = float(_pb_opens[-2])
-                        _pb_c = float(_pb_closes[-2])
-                        if _pb_c < _pb_o:
-                            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
-                                  f"前K线阴线({_pb_c:.2f}<{_pb_o:.2f})，跳过")
-                            continue
-                except Exception:
-                    pass  # 获取失败时不过滤
+            # 打印 K 线状态（便于回溯；prev_bar_up 语义已内含于收阳检查中）
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
+                  f"5min已完成K线: open={bar_o:.2f} close={bar_c:.2f} "
+                  f"涨幅={change_pct:.2%} 收阳={'yes' if bar_c > bar_o else 'no'} vol={bar_v:.0f}")
 
             if not self._check_buy_signal(code, bar, pre_close):
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} 不满足买入条件: "
-                      f"涨幅={change_pct:.2%}, 收阳={is_positive}, last={last_price:.2f}")
+                      f"涨幅={change_pct:.2%}, 收阳={bar_c > bar_o}, close={bar_c:.2f}")
                 continue
 
-            # 计算买入数量（卖一价）
-            ask_prices = tick.get('askPrice', [])
-            ask_price = ask_prices[0] if ask_prices else last_price
-            if ask_price <= 0:
-                ask_price = last_price
+            # ── 实时价智能路由：下单前重查卖一价，决定下单价与等待超时 ──────────────
+            # 规则：卖一价≤bar_c 或溢价≤阈值 → 用实时价，快速成交（60s）
+            #       溢价>阈值 → 挂 bar_c 等价格回落（300s），超时宁可不买
+            _fresh_tick = self._get_full_tick([symbol]).get(symbol, {})
+            _ask_list = _fresh_tick.get('askPrice', [])
+            _ask = float(_ask_list[0]) if _ask_list else 0.0
+            if _ask <= 0:
+                _ask = float(_fresh_tick.get('lastPrice', bar_c) or bar_c)
+            _buy_slip_max = getattr(config, 'V3_LIVE_BUY_SLIP_MAX', 0.003)
+            _slip_buy = (_ask - bar_c) / bar_c if bar_c > 0 and _ask > bar_c else 0.0
+
+            if _ask <= bar_c:
+                order_price  = _ask
+                _buy_timeout = 60
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                      f"卖一价{_ask:.3f}\u2264close{bar_c:.3f}，直接买入（无溢价）")
+            elif _slip_buy <= _buy_slip_max:
+                order_price  = _ask
+                _buy_timeout = 60
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                      f"卖一价{_ask:.3f} 溢价{_slip_buy:.2%}\u2264{_buy_slip_max:.2%}，接受实时价")
+            else:
+                order_price  = bar_c
+                _buy_timeout = 300
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                      f"卖一价{_ask:.3f} 溢价{_slip_buy:.2%}>{_buy_slip_max:.2%}，"
+                      f"挂close价{bar_c:.3f}等待回落（超时不买）")
+            # ─────────────────────────────────────────────────────────────────
 
             # 可用资金重新计算（前面可能已经买入了）
             available_cash = self._get_available_cash()
-            volume_to_buy = self._calculate_buy_volume(available_cash, ask_price)
+            volume_to_buy = self._calculate_buy_volume(available_cash, order_price)
 
             if volume_to_buy <= 0:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 资金不足或股数为0，跳过")
                 continue
 
             # 检查资金
-            total_cost = ask_price * volume_to_buy * (1 + self.commission_rate)
+            total_cost = order_price * volume_to_buy * (1 + self.commission_rate)
             if total_cost > available_cash:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 资金不足: 需{total_cost:.0f} 可用{available_cash:.0f}")
                 continue
 
-            # 下单
+            # 下单（以路由决定的价格为限价）
             order_id = self._place_buy_order(
                 code=code,
-                price=ask_price,
+                price=order_price,
                 volume=volume_to_buy,
                 remark=f"V3_buy_{code}"
             )
 
             if not order_id or order_id == -1:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 买入下单失败，尝试下一只")
-                self._log_failed_order('buy', code, ask_price, volume_to_buy, 0, 'order_failed',
-                                       {'last_price': last_price, 'change_pct': round(change_pct, 4),
-                                        'ask_price': ask_price})
+                self._log_failed_order('buy', code, order_price, volume_to_buy, 0, 'order_failed',
+                                       {'bar_close': bar_c, 'change_pct': round(change_pct, 4),
+                                        'order_price': order_price})
                 continue
 
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入委托: {code} "
-                  f"价格={ask_price:.3f} 数量={volume_to_buy} order_id={order_id}")
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入委托已提交: {code} "
+                  f"价格={order_price:.3f} 数量={volume_to_buy} order_id={order_id}")
 
-            # 等待并获取实际成交明细（支持部分成交）
-            # monitor_while_waiting=True：等待期间每10s同步执行一次止损/止盈检查
-            buy_result = self._wait_fill_result(order_id, timeout=300, monitor_while_waiting=True)
-            actual_qty = buy_result['filled_qty']
-
-            if actual_qty > 0:
-                # 按实际成交量记录持仓和扣除资金
-                buy_cost   = ask_price * actual_qty
-                commission = max(buy_cost * self.commission_rate, self.min_commission)
-                total_paid = buy_cost + commission
-                self.cash -= total_paid
-
-                pos = {
-                    'code':         code,
-                    'symbol':       symbol,
-                    'buy_price':    ask_price,
-                    'buy_date':     today_str,
-                    'quantity':     actual_qty,
-                    'days_held':    0,
-                    'sell_type':    None,
-                    'highest_price': ask_price,
-                }
-                # 部分成交时记录计划数量，供仓表盘标记显示
-                if actual_qty < volume_to_buy:
-                    pos['intended_qty'] = volume_to_buy
-                    self._log_failed_order('buy', code, ask_price, volume_to_buy, actual_qty, 'partial',
-                                           {'last_price': last_price, 'change_pct': round(change_pct, 4)})
-                self.positions.append(pos)
-
-                if buy_result['status'] == 'filled':
-                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入全量成交: {code} "
-                          f"价格={ask_price:.3f} 数量={actual_qty} "
-                          f"总成本={total_paid:.2f} 佣金={commission:.2f} "
-                          f"剩余现金={self.cash:.2f}")
-                else:
-                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入部分成交: {code} "
-                          f"实际={actual_qty}/计划={volume_to_buy} 价格={ask_price:.3f} "
-                          f"总成本={total_paid:.2f} 剩余现金={self.cash:.2f}")
-
-                self._log_trade('buy', code, ask_price, actual_qty, 'buy_signal', fee=commission)
-                self._save_state()
-
-                # 买入当天不挂条件单（T+1）；次日启动恢复时统一批量重建
-                # 若已持仓超过一天（源于恶意调用），立即挂单
-                if _calculate_days_held(pos) > 0:
-                    self._setup_condition_order(pos)
-
-                # 钉钉通知：买入成交
-                if _NOTIFIER_OK:
-                    try:
-                        _chg = (ask_price - pre_close) / pre_close * 100 if pre_close > 0 else 0
-                        _notify_buy(code=code, price=ask_price, volume=actual_qty,
-                                    amount=total_paid, change_pct=_chg)
-                    except Exception:
-                        pass
-
-            else:
-                # 完全未成交，_wait_fill_result 超时时已自动撤单
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 买入超时未成交，已撤单，当日不再重试")
-                self._failed_buys_today[code] = today_str
-                failed_today.add(code)
-                self._log_failed_order('buy', code, ask_price, volume_to_buy, 0, 'timeout',
-                                       {'last_price': last_price, 'change_pct': round(change_pct, 4)})
-                continue
+            # ── 非阻塞：记录pending，立即继续扫描下一只 ────────────────────────
+            deadline = datetime.now() + timedelta(seconds=_buy_timeout)
+            self._pending_buy_orders[order_id] = {
+                'code':         code,
+                'symbol':       symbol,
+                'price':        order_price,
+                'intended_qty': volume_to_buy,
+                'placed_at':    datetime.now().isoformat(),
+                'deadline':     deadline.isoformat(),
+                'pre_close':    pre_close,
+                'bar_c':        bar_c,
+                'change_pct':   change_pct,
+            }
+            pending_count += 1
+            self._save_state()
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [非阻塞] {code} "
+                  f"买单已挂出，截止确认时间={deadline.strftime('%H:%M:%S')}，"
+                  f"继续扫描下一只")
+            # ─────────────────────────────────────────────────────────────────────────────
 
     # ------------------------------------------------------------------
     # 收盘前检查（14:55）
@@ -1236,10 +1433,10 @@ class LiveEngineV3:
     def _check_close_signals(self):
         """收盘前检查阴跌/时间止损，生成 pending_sells
 
-        规则：
-        1. 阴跌止损：收盘价 < open（收阴线）且跌幅 > soft_stop_loss → pending
-        2. 时间止损：持仓 >= time_stop_days 天且收盘价 <= 买入价 → pending
-        3. 止盈信号（当日 high >= 止盈价）→ pending
+        规则（与回测对齐，使用 14:55 那根 5分钟 bar 的 close）：
+        1. 阴跌止损：14:55 bar close < open（收阴线）且跌幅 > soft_stop_loss → pending
+        2. 时间止损：持仓 >= time_stop_days 天且 14:55 bar close <= 买入价 → pending
+        3. 移动止盈：最高价激活后 close 触达回撤线 → pending
 
         pending_sells 中的股票将在次日 9:15 集合竞价中挂单卖出
         """
@@ -1249,6 +1446,9 @@ class LiveEngineV3:
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 执行收盘前信号检查...")
 
         codes = [_format_symbol(_strip_suffix(p.get('code', p.get('symbol', '')))) for p in self.positions]
+        # 14:55 那根 5分钟bar（主要价格源，与回测对齐）
+        pos_bars = self._get_position_5m_bars()
+        # tick 付辅：提供当天开盘价（open字段），以及 bar 无数据时兜底
         ticks = self._get_full_tick(codes)
         today_str = date.today().strftime('%Y-%m-%d')
 
@@ -1256,13 +1456,21 @@ class LiveEngineV3:
             code = _strip_suffix(pos.get('code', pos.get('symbol', '')))
             symbol = _format_symbol(code)
             tick = ticks.get(symbol)
-            if not tick:
+            bar_data = pos_bars.get(code)
+
+            # 14:55 收盘价：优先用 bar close（与回测对齐），无bar时用 tick lastPrice 兜底
+            if bar_data:
+                last_price = bar_data['close']
+            elif tick:
+                last_price = tick.get('lastPrice', 0)
+            else:
+                continue
+            if last_price <= 0:
                 continue
 
-            last_price = tick.get('lastPrice', 0)
-            open_price = tick.get('open', 0)
-            high_price = tick.get('high', 0)
-            pre_close = tick.get('lastClose', 0) or tick.get('preClose', 0)
+            # 开盘价：用 tick.open（当天全天开盘价，与回测 day_open_price 等价）
+            open_price = tick.get('open', 0) if tick else 0
+            pre_close = tick.get('lastClose', 0) or tick.get('preClose', 0) if tick else 0
 
             buy_price = pos.get('buy_price', 0)
             if buy_price <= 0:
@@ -1429,7 +1637,7 @@ class LiveEngineV3:
         返回 dict:
             status:     'filled' | 'partial' | 'cancelled' | 'timeout'
             filled_qty: 已成交股数
-            fill_price: 委托价格（目前 QMT API 没有均价字段，用委托价待修）
+            fill_price: 实际成交均价（优先从 query_trades 获取；API 不支持时降级为委托价）
 
         monitor_while_waiting: True 时每轮轮询后额外执行一次 _monitor_positions()，
             用于买入等待期间持续监控持仓的止损/止盈，避免被买入循环阻塞而错过卖出时机。
@@ -1448,9 +1656,12 @@ class LiveEngineV3:
                     price     = o.get('price', 0) or 0
                     last_traded, last_price = traded, price
                     if status == ORDER_STATUS_FILLED:
-                        return {'status': 'filled', 'filled_qty': traded, 'fill_price': price}
+                        # 尝试从成交明细获取实际均价（比委托价更准确）
+                        actual_price = self._get_actual_fill_price(order_id, price)
+                        return {'status': 'filled', 'filled_qty': traded, 'fill_price': actual_price}
                     if status in (ORDER_STATUS_CANCELLED, ORDER_STATUS_REJECTED):
-                        return {'status': 'cancelled', 'filled_qty': traded, 'fill_price': price}
+                        actual_price = self._get_actual_fill_price(order_id, price)
+                        return {'status': 'cancelled', 'filled_qty': traded, 'fill_price': actual_price}
                     # ORDER_STATUS_PARTIAL (53) → 继续等待
             # 买入等待期间：持续监控持仓止损/止盈，避免被买入循环阻塞
             if monitor_while_waiting:
@@ -1467,8 +1678,177 @@ class LiveEngineV3:
             if o.get('order_id') == order_id:
                 traded = o.get('traded_volume', 0) or 0
                 price  = o.get('price', 0) or 0
-                return {'status': 'timeout', 'filled_qty': traded, 'fill_price': price}
+                actual_price = self._get_actual_fill_price(order_id, price)
+                return {'status': 'timeout', 'filled_qty': traded, 'fill_price': actual_price}
         return {'status': 'timeout', 'filled_qty': last_traded, 'fill_price': last_price}
+
+    def _get_actual_fill_price(self, order_id: int, fallback_price: float) -> float:
+        """从成交明细中获取实际成交均价，API 不支持或无数据时降级为 fallback_price"""
+        try:
+            if self.executor is None or not hasattr(self.executor, 'query_trades'):
+                return fallback_price
+            trades = self.executor.query_trades()
+            matched = [t for t in trades if t.get('order_id') == order_id and t.get('traded_volume', 0) > 0]
+            if not matched:
+                return fallback_price
+            # 加权均价
+            total_vol = sum(t['traded_volume'] for t in matched)
+            total_amt = sum(t['traded_volume'] * t['traded_price'] for t in matched)
+            avg_price = round(total_amt / total_vol, 3) if total_vol > 0 else fallback_price
+            return avg_price
+        except Exception:
+            return fallback_price
+
+    # ------------------------------------------------------------------
+    # 非阻塞买入：持仓记录 & pending买单检查
+    # ------------------------------------------------------------------
+    def _record_buy_fill(self, info: dict, actual_qty: int, fill_price: float, today_str: str):
+        """记录买入成交，更新持仓和现金（供 _check_pending_buy_orders 调用）"""
+        code         = info['code']
+        symbol       = info['symbol']
+        order_price  = info['price']
+        volume_to_buy = info['intended_qty']
+        pre_close    = info.get('pre_close', 0)
+        bar_c        = info.get('bar_c', order_price)
+        change_pct   = info.get('change_pct', 0)
+
+        buy_cost   = order_price * actual_qty
+        commission = max(buy_cost * self.commission_rate, self.min_commission)
+        total_paid = buy_cost + commission
+        self.cash -= total_paid
+
+        pos = {
+            'code':          code,
+            'symbol':        symbol,
+            'buy_price':     order_price,
+            'buy_date':      today_str,
+            'quantity':      actual_qty,
+            'days_held':     0,
+            'sell_type':     None,
+            'highest_price': order_price,
+        }
+        if actual_qty < volume_to_buy:
+            pos['intended_qty'] = volume_to_buy
+            self._log_failed_order('buy', code, order_price, volume_to_buy, actual_qty, 'partial',
+                                   {'bar_close': bar_c, 'change_pct': round(change_pct, 4)})
+        self.positions.append(pos)
+
+        if actual_qty >= volume_to_buy:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入全量成交(pending确认): {code} "
+                  f"价格={order_price:.3f} 数量={actual_qty} "
+                  f"总成本={total_paid:.2f} 佣金={commission:.2f} "
+                  f"剩余现金={self.cash:.2f}")
+        else:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入部分成交(pending确认): {code} "
+                  f"实际={actual_qty}/计划={volume_to_buy} 价格={order_price:.3f} "
+                  f"总成本={total_paid:.2f} 剩余现金={self.cash:.2f}")
+
+        self._log_trade('buy', code, order_price, actual_qty, 'buy_signal', fee=commission)
+        self._save_state()
+
+        # 买入当天不挂条件单（T+1）；次日启动时统一批量重建
+        if _calculate_days_held(pos) > 0:
+            self._setup_condition_order(pos)
+
+        # 钉钉通知
+        if _NOTIFIER_OK:
+            try:
+                _chg = (order_price - pre_close) / pre_close * 100 if pre_close > 0 else 0
+                _notify_buy(code=code, price=order_price, volume=actual_qty,
+                            amount=total_paid, change_pct=_chg)
+            except Exception:
+                pass
+
+    def _check_pending_buy_orders(self):
+        """检查所有非阻塞挂出的买单状态，处理成交/超时/撤单
+
+        每次 _scan_and_buy 开始时调用，确保 pending 槽位及时释放。
+        """
+        if not self._pending_buy_orders:
+            return
+
+        today_str = date.today().strftime('%Y-%m-%d')
+        now       = datetime.now()
+        to_remove = []
+
+        # 批量查一次订单，减少 API 调用
+        try:
+            all_orders = self._query_orders()
+        except Exception as _qe:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] 查单异常({_qe})，本次跳过检查")
+            return
+        orders_by_id = {o.get('order_id'): o for o in all_orders}
+
+        for oid, info in list(self._pending_buy_orders.items()):
+            code     = info['code']
+            deadline = datetime.fromisoformat(info['deadline'])
+            o        = orders_by_id.get(oid)
+
+            if o is None:
+                # 查不到订单（可能重启后order_id失效）
+                if now >= deadline:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 查不到订单{oid}，已超时，移除")
+                    self._failed_buys_today[code] = today_str
+                    to_remove.append(oid)
+                continue
+
+            status = o.get('status', -1)
+            traded = o.get('traded_volume', 0) or 0
+            price  = o.get('price', 0) or 0
+
+            if status == ORDER_STATUS_FILLED:
+                # 全成交
+                actual_price = self._get_actual_fill_price(oid, price)
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 确认全成交 qty={traded}")
+                self._record_buy_fill(info, traded, actual_price, today_str)
+                to_remove.append(oid)
+
+            elif status in (ORDER_STATUS_CANCELLED, ORDER_STATUS_REJECTED):
+                # 已撤/废单：处理部分成交
+                actual_price = self._get_actual_fill_price(oid, price)
+                if traded > 0:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 撤单后部分成交 qty={traded}")
+                    self._record_buy_fill(info, traded, actual_price, today_str)
+                else:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 已撤/废单，未成交")
+                self._failed_buys_today[code] = today_str
+                to_remove.append(oid)
+
+            elif now >= deadline:
+                # 超时：主动撤单，取最终成交量
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 买单超时，主动撤单")
+                self._cancel_order(oid)
+                import time as _time; _time.sleep(2)
+                # 重新查一次获取最终成交量
+                try:
+                    final_orders = self._query_orders()
+                    for fo in final_orders:
+                        if fo.get('order_id') == oid:
+                            traded = fo.get('traded_volume', 0) or 0
+                            price  = fo.get('price', 0) or 0
+                            break
+                except Exception:
+                    pass
+                actual_price = self._get_actual_fill_price(oid, price)
+                if traded > 0:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 超时后部分成交 qty={traded}，记录持仓")
+                    self._record_buy_fill(info, traded, actual_price, today_str)
+                else:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] {code} 超时未成交，当日不再重试")
+                    self._log_failed_order('buy', code, info['price'], info['intended_qty'], 0, 'timeout',
+                                           {'bar_close': info.get('bar_c', 0),
+                                            'change_pct': round(info.get('change_pct', 0), 4)})
+                self._failed_buys_today[code] = today_str
+                to_remove.append(oid)
+            # else: 状态为 partial 或仍在排队，且未超时 → 继续等待
+
+        for oid in to_remove:
+            del self._pending_buy_orders[oid]
+
+        if to_remove:
+            self._save_state()
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [pending] 本轮处理 {len(to_remove)} 笔，"
+                  f"剩余pending={len(self._pending_buy_orders)}")
 
     def _record_sell_fill(self, code: str, filled_qty: int, fill_price: float,
                           sell_type: str, buy_price: float, days_held: int, pos: dict):
@@ -1515,22 +1895,52 @@ class LiveEngineV3:
     def _execute_sell_with_fallback(self, code: str, sell_price: float, quantity: int,
                                     sell_type: str, pos: dict,
                                     buy_price: float, days_held: int):
-        """三段式卖出：限价单 → 对手价 → pending_sells
+        """三段式卖出：实时买一价 → 最新买一价 → pending_sells
 
-        第1轮（3分钟）：按止损价/止盈价挂限价单
-        第2轮（2分钟）：按买一价（对手价）重挂
+        第1轮（60s）：实时路由获取买一价，优先保证成交
+                  — 买一价≥止损价：更优，直接成交
+                  — 折价≤阈值：可接受，以市场价成交
+                  — 折价>阈值：警告但仍用买一价（止损优先成交）
+        第2轮（2分钟）：按最新买一价重挂（处理第1轮部分成交剩余量）
         第3轮（底探）：加入 pending_sells，次日竞价执行
         每轮实时结算部分成交，剩余量进入下一轮。
         """
         remaining = quantity
 
-        # ── 第1轮：限价单（止损价/止盈价） 3分钟 ─────────────────────────
+        # ── 实时价智能路由：获取买一价，判断折价幅度 ─────────────────────────────────
+        _sym      = _format_symbol(code)
+        _ft       = self._get_full_tick([_sym]).get(_sym, {})
+        _bid_list = _ft.get('bidPrice', [])
+        _bid      = float(_bid_list[0]) if _bid_list else 0.0
+        if _bid <= 0:
+            _bid = float(_ft.get('lastPrice', sell_price) or sell_price)
+        if _bid <= 0:
+            _bid = sell_price
+        _sell_slip_max = getattr(config, 'V3_LIVE_SELL_SLIP_MAX', 0.003)
+        _sell_slip = (sell_price - _bid) / sell_price if sell_price > 0 and _bid < sell_price else 0.0
+
+        if _bid >= sell_price:
+            r1_price = _bid
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                  f"买一价{_bid:.3f}≥止损价{sell_price:.3f}，用买一价成交（无折价）")
+        elif _sell_slip <= _sell_slip_max:
+            r1_price = _bid
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                  f"买一价{_bid:.3f} 折价{_sell_slip:.2%}≤{_sell_slip_max:.2%}，接受实时价")
+        else:
+            r1_price = _bid   # 折价>阈值，仍用买一价（止损优先成交）
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由][WARN] {code} "
+                  f"买一价{_bid:.3f} 折价{_sell_slip:.2%}>{_sell_slip_max:.2%}，"
+                  f"超阈值仍强制用买一价（止损优先成交）")
+        # ─────────────────────────────────────────────────────────────────────────
+
+        # ── 第1轮：实时买一价限价，60s ────────────────────────────────────────────
         order_id = self._place_sell_order(
-            code=code, price=sell_price, volume=remaining,
+            code=code, price=r1_price, volume=remaining,
             remark=f"V3_{sell_type}_{code}_r1"
         )
         if order_id and order_id != -1:
-            r1 = self._wait_fill_result(order_id, timeout=180)
+            r1 = self._wait_fill_result(order_id, timeout=60)
             if r1['filled_qty'] > 0:
                 self._record_sell_fill(code, r1['filled_qty'], r1['fill_price'],
                                        sell_type, buy_price, days_held, pos)
@@ -1543,7 +1953,7 @@ class LiveEngineV3:
         if remaining <= 0:
             return
 
-        # ── 第2轮：对手价（买一价） 2分钟 ──────────────────────────
+        # ── 第2轮：最新买一价 2分钟 ────────────────────────────────────────────────
         symbol = _format_symbol(code)
         tick = self._get_full_tick([symbol]).get(symbol, {})
         bid_prices = tick.get('bidPrice', [])
@@ -1554,7 +1964,7 @@ class LiveEngineV3:
             bid_price = sell_price
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] {code} 第1轮未全部成交 "
-              f"剩余 {remaining} 股，改用对手价 {bid_price:.3f} 重挂...")
+              f"剩余 {remaining} 股，第2轮按最新买一价 {bid_price:.3f} 重挂...")
         order_id2 = self._place_sell_order(
             code=code, price=bid_price, volume=remaining,
             remark=f"V3_{sell_type}_{code}_r2"
@@ -2004,6 +2414,7 @@ class LiveEngineV3:
             '_last_increment_date': self._last_increment_date,
             '_daily_filter_date': self._daily_filter_date,
             '_daily_filter_cache': self._daily_filter_cache,
+            '_pending_buy_orders': {str(k): v for k, v in self._pending_buy_orders.items()},
         }
 
         try:
