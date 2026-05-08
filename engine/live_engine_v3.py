@@ -1377,8 +1377,9 @@ class LiveEngineV3:
                   f"涨幅={change_pct:.2%} 收阳(>日开)={_bullish_str} vol={bar_v:.0f}")
 
             if not self._check_buy_signal(code, bar, pre_close, day_open=day_open):
+                _ref = day_open if day_open > 0 else bar_o
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} 不满足买入条件: "
-                      f"涨幅={change_pct:.2%}, 收阳={bar_c > bar_o}, close={bar_c:.2f}")
+                      f"涨幅={change_pct:.2%}, 收阳(>日开)={bar_c > _ref}, close={bar_c:.2f} 日开={_ref:.2f}")
                 continue
 
             # ── 实时价智能路由：下单前重查卖一价，决定下单价与等待超时 ──────────────
