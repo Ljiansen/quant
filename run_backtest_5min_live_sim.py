@@ -308,12 +308,12 @@ def run_simulation(start_date: str, end_date: str, initial_capital: float = 300_
     """
     主入口：逐日逐根5分钟K线模拟完整交易逻辑。
     start_date / end_date 格式: 'YYYYMMDD'
-    fivemin_dir:     可选，覆盖默认5分钟数据目录
-    extra_daily_dir: 可选，额外日线数据目录（用于补充历史年份，如2021年）
-    buy_price_mode:  'close'（默认，5分钟K线收盘价）或 'high'（K线最高价，对齐实盘）
-    prev_bar_up:     True 时要求上一根5分钟K线非阴线（close >= open）才允许买入
-    no_open_30:      True 时跳过开盘前30分钟（9:35-9:55）的买入信号
-    slippage:        双向滑点（单边），买入×(1+slip)，卖出×(1-slip)
+    fivemin_dir:      可选，覆盖默认5分钟数据目录
+    extra_daily_dir:  可选，额外日线数据目录（用于补充历史年份，如2021年）
+    buy_price_mode:   'close'（默认，5分钟K线收盘价）或 'high'（K线最高价，对齐实盘）
+    prev_bar_up:      True 时要求上一根5分钟K线非阴线（close >= open）才允许买入
+    no_open_30:       True 时跳过开盘前30分钟（9:35-9:55）的买入信号
+    slippage:         双向滑点（单边），买入×(1+slip)，卖出×(1-slip)
     """
     global SLIPPAGE
     SLIPPAGE = slippage
@@ -559,12 +559,15 @@ def run_simulation(start_date: str, end_date: str, initial_capital: float = 300_
                     if not prev_close or prev_close <= 0:
                         continue
 
-                    # 买入条件：涨幅始终用bar_c计算（对齐实盘），收阳线用K线自身open/close判断
+                    # 买入条件：收阳线判断（bar收盘价 > 当日9:30开盘价，对齐实盘tick.open）
+                    day_open_price = day_open_cache[code].get(day_str)
+                    if not day_open_price or day_open_price <= 0:
+                        continue
                     chg = (bar['close'] - prev_close) / prev_close
                     if (chg > _min_chg(code)
                             and chg < _max_chg(code)
-                            and bar['close'] > bar['open']  # 收阳：K线close > K线open（对齐实盘）
-                            and chg < _limit_up(code)):     # 未涨停
+                            and buy_px > day_open_price   # 收阳：bar收盘价 > 当日开盘价
+                            and chg < _limit_up(code)):   # 未涨停
 
                         qty = _buy_qty(cash, len(positions), buy_px)
                         if qty <= 0:

@@ -1310,11 +1310,13 @@ class LiveEngineV3:
 
             symbol = _format_symbol(code)
 
-            # 从 tick 获取昨日收盘价（pre_close），用于涨幅计算
+            # 从 tick 获取昨日收盘价（pre_close）和当日开盘价（day_open），用于涨幅和收阳判断
             tick = ticks.get(symbol)
             pre_close = 0
+            day_open  = 0
             if tick:
                 pre_close = tick.get('lastClose', 0) or tick.get('preClose', 0)
+                day_open  = float(tick.get('open', 0) or 0)
             if pre_close <= 0:
                 continue
 
@@ -1368,12 +1370,13 @@ class LiveEngineV3:
             }
             change_pct = (bar_c - pre_close) / pre_close if pre_close > 0 else 0
 
-            # 打印 K 线状态（便于回溯；prev_bar_up 语义已内含于收阳检查中）
+            # 打印 K 线状态
+            _bullish_str = 'yes' if (day_open > 0 and bar_c > day_open) else ('no' if day_open > 0 else f'bar:{bar_c>bar_o}')
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
                   f"5min已完成K线: open={bar_o:.2f} close={bar_c:.2f} "
-                  f"涨幅={change_pct:.2%} 收阳={'yes' if bar_c > bar_o else 'no'} vol={bar_v:.0f}")
+                  f"涨幅={change_pct:.2%} 收阳(>日开)={_bullish_str} vol={bar_v:.0f}")
 
-            if not self._check_buy_signal(code, bar, pre_close):
+            if not self._check_buy_signal(code, bar, pre_close, day_open=day_open):
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} 不满足买入条件: "
                       f"涨幅={change_pct:.2%}, 收阳={bar_c > bar_o}, close={bar_c:.2f}")
                 continue
@@ -2277,13 +2280,15 @@ class LiveEngineV3:
     # ------------------------------------------------------------------
     # 买入信号检查
     # ------------------------------------------------------------------
-    def _check_buy_signal(self, code: str, bar: dict, pre_close: float) -> bool:
+    def _check_buy_signal(self, code: str, bar: dict, pre_close: float,
+                           day_open: float = 0) -> bool:
         """检查买入条件
 
         条件（全部满足）：
         1. 涨幅 > 阈值（科创板/创业板>2%，主板>1%）
         2. 涨幅 < 防追高阈值（科创/创业板<8%，主板<5%）
-        3. 收阳线：close > open
+        3. 收阳线：bar收盘价 > 当日9:30开盘价（tick.open），对齐回测逻辑
+           若 day_open 无效则降级为 bar['close'] > bar['open']
         4. 未涨停（科创板/创业板<19.8%，主板<9.8%）
         """
         if pre_close <= 0:
@@ -2310,8 +2315,9 @@ class LiveEngineV3:
         if change_pct >= max_change:
             return False
 
-        # 3. 收阳线
-        if close <= open_price:
+        # 3. 收阳线：bar收盘价 > 当日9:30开盘价；day_open无效时降级为bar自身阴阳
+        ref_open = day_open if day_open > 0 else open_price
+        if close <= ref_open:
             return False
 
         # 4. 未涨停
