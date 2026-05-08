@@ -1260,7 +1260,7 @@ class LiveEngineV3:
                 field_list=['open', 'high', 'low', 'close', 'volume'],
                 stock_list=symbols,
                 period='5m',
-                count=2
+                count=3  # [-1]=成型中, [-2]=最新完成bar, [-3]=前一完成bar(供prev_bar_up使用)
             )
 
             def _kd_get(field):
@@ -1318,7 +1318,7 @@ class LiveEngineV3:
             if pre_close <= 0:
                 continue
 
-            # 取最新已完成的 5 分钟 K 线（count=2 中的 [-2]；[-1] 为当前成型 Bar）
+            # 取最新已完成的 5 分钟 K 线（count=3 中的 [-2]；[-1] 为成型中Bar；[-3] 为前一完成Bar）
             _bar_opens  = _kd_opens.get(symbol,  [])
             _bar_highs  = _kd_highs.get(symbol,  [])
             _bar_lows   = _kd_lows.get(symbol,   [])
@@ -1346,6 +1346,17 @@ class LiveEngineV3:
             # 无效K线（停牌/无数据）
             if bar_v <= 0 or bar_c <= 0:
                 continue
+
+            # prev_bar_up 过滤：上一根完成bar需为非阴线（close >= open）
+            if self.prev_bar_up:
+                if len(_bar_closes) < 3:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] {code} "
+                          f"prev_bar_up=True 但bar数量不足(<3)，跳过")
+                    continue
+                _prev_bar_c = float(_bar_closes[-3])
+                _prev_bar_o = float(_bar_opens[-3])
+                if _prev_bar_c < _prev_bar_o:  # 前K为阴线，跳过
+                    continue
 
             bar = {
                 'open':   bar_o,
