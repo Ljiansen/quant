@@ -22,7 +22,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 
 sys.path.insert(0, 'd:/miniqmt_quant')
 import config
@@ -327,6 +327,17 @@ class LiveEngineV3:
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 进入主循环，等待交易时段...")
 
+        # 4. 开盘前等待（若早于 09:00 启动，循环休眠直至市场开盘）
+        while not _market_is_open():
+            now = datetime.now()
+            t = now.hour * 60 + now.minute
+            # 若已过 15:01（收盘后），无需等待，直接进入盘后流程
+            if t > 15 * 60 + 1:
+                break
+            wait_min = max(0, 9 * 60 - t)
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 开盘前等待，距09:00还有约 {wait_min} 分钟，休眠30秒...")
+            time.sleep(30)
+
         # 4. 主循环
         _heartbeat_counter = 0   # 心跳计数器，每5分钟刷新一次 last_update
         try:
@@ -391,8 +402,9 @@ class LiveEngineV3:
                     traceback.print_exc()
 
                 # 心跳：每5分钟刷新一次 last_update，保证仪表盘时间显示准确
+                # sleep(30) × 10次 = 5分钟
                 _heartbeat_counter += 1
-                if _heartbeat_counter >= 5:
+                if _heartbeat_counter >= 10:
                     try:
                         self._save_state()
                         self._maybe_reload_rebalance_pool()  # 热重载调仓池
@@ -401,8 +413,8 @@ class LiveEngineV3:
                         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 心跳处理异常: {_he}")
                     _heartbeat_counter = 0
 
-                # 每分钟轮询一次
-                time.sleep(60)
+                # 每30秒轮询一次（对齐回测精度，减少信号延迟）
+                time.sleep(30)
 
         except KeyboardInterrupt:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 收到中断信号，正在退出...")
@@ -935,7 +947,10 @@ class LiveEngineV3:
                 sell_type = pos.get('sell_type', 'pending')
                 commission = max(sell_price * quantity * self.commission_rate, self.min_commission)
                 stamp_tax = sell_price * quantity * self.stamp_tax_rate
-                self._log_trade('sell', code, sell_price, quantity, sell_type, fee=commission+stamp_tax, days_held=days_held)
+                actual_fill = self._get_actual_fill_price(order_id, sell_price)
+                self._log_trade('sell', code, actual_fill, quantity, sell_type,
+                                fee=commission+stamp_tax, days_held=days_held,
+                                slip_ref=sell_price)
                 self._remove_position(code)
                 self._remove_pending_sell(code)
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 竞价卖出成交: {code} "
@@ -1183,6 +1198,12 @@ class LiveEngineV3:
         6. 成交 → 记录持仓
         7. 未成交 → 撤单 → 下一只
         """
+        # 开盘首根K线（9:30-9:35）不触发买入，与回测逻辑对齐
+        # 最早买入时间：9:40（基于 9:35-9:40 完成K线判断）
+        _now_time = datetime.now().time()
+        if _now_time < dtime(9, 40):
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 当前时间{_now_time.strftime('%H:%M')} < 09:40，首根K线不触发买入，跳过")
+            return
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] [扫描] 开始扫描买入，"
               f"调仓池={len(self.rebalance_pool)}只，持仓={len(self.positions)}/{self.max_positions}")
 
@@ -1743,7 +1764,7 @@ class LiveEngineV3:
                   f"实际={actual_qty}/计划={volume_to_buy} 价格={order_price:.3f} "
                   f"总成本={total_paid:.2f} 剩余现金={self.cash:.2f}")
 
-        self._log_trade('buy', code, order_price, actual_qty, 'buy_signal', fee=commission)
+        self._log_trade('buy', code, order_price, actual_qty, 'buy_signal', fee=commission, slip_ref=bar_c)
         self._save_state()
 
         # 买入当天不挂条件单（T+1）；次日启动时统一批量重建
@@ -1851,7 +1872,8 @@ class LiveEngineV3:
                   f"剩余pending={len(self._pending_buy_orders)}")
 
     def _record_sell_fill(self, code: str, filled_qty: int, fill_price: float,
-                          sell_type: str, buy_price: float, days_held: int, pos: dict):
+                          sell_type: str, buy_price: float, days_held: int, pos: dict,
+                          intended_price: float = 0):
         """记录卖出成交（支持全量/部分），更新持仓与资金"""
         net_income  = self._calc_sell_income(fill_price, filled_qty)
         cost        = buy_price * filled_qty
@@ -1871,7 +1893,8 @@ class LiveEngineV3:
 
         self.cash += net_income
         self._log_trade('sell', code, fill_price, filled_qty, sell_type,
-                        fee=commission + stamp_tax, days_held=days_held)
+                        fee=commission + stamp_tax, days_held=days_held,
+                        slip_ref=intended_price if intended_price > 0 else 0)
 
         orig_qty  = pos.get('quantity', 0)
         remaining = orig_qty - filled_qty
@@ -1943,7 +1966,8 @@ class LiveEngineV3:
             r1 = self._wait_fill_result(order_id, timeout=60)
             if r1['filled_qty'] > 0:
                 self._record_sell_fill(code, r1['filled_qty'], r1['fill_price'],
-                                       sell_type, buy_price, days_held, pos)
+                                       sell_type, buy_price, days_held, pos,
+                                       intended_price=sell_price)
                 remaining -= r1['filled_qty']
                 pos = dict(pos)
                 pos['quantity'] = remaining
@@ -1973,7 +1997,8 @@ class LiveEngineV3:
             r2 = self._wait_fill_result(order_id2, timeout=120)
             if r2['filled_qty'] > 0:
                 self._record_sell_fill(code, r2['filled_qty'], r2['fill_price'],
-                                       sell_type, buy_price, days_held, pos)
+                                       sell_type, buy_price, days_held, pos,
+                                       intended_price=sell_price)
                 remaining -= r2['filled_qty']
                 pos = dict(pos)
                 pos['quantity'] = remaining
@@ -2040,7 +2065,8 @@ class LiveEngineV3:
             try:
                 asset = self.executor.query_asset()
                 real_cash = asset.get('cash', 0)
-                return max(0.0, min(real_cash, remaining_limit))
+                # 同时受 self.cash 约束：防止亏损后 remaining_limit 虚高导致超支
+                return max(0.0, min(real_cash, remaining_limit, self.cash))
             except Exception as e:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] 查询资产异常: {e}，使用本地cash")
 
@@ -2292,7 +2318,7 @@ class LiveEngineV3:
     # ------------------------------------------------------------------
     # 交易日志记录
     # ------------------------------------------------------------------
-    def _log_trade(self, trade_type, code, price, quantity, reason, fee=0, days_held=0):
+    def _log_trade(self, trade_type, code, price, quantity, reason, fee=0, days_held=0, slip_ref=0):
         """追加一条交易记录到日志文件"""
         try:
             trade = {
@@ -2308,6 +2334,28 @@ class LiveEngineV3:
                 "total_value": round(self.cash + sum(p['buy_price'] * p['quantity'] for p in self.positions), 2),
                 "days_held": days_held
             }
+            # 滑点记录（slip_ref=信号参考价）
+            if slip_ref > 0:
+                if trade_type == 'buy':
+                    # 买入滑点：实际成交价 vs K线收盘参考价，正值=追高
+                    slip_pct = round((price - slip_ref) / slip_ref * 100, 3)
+                else:
+                    # 卖出滑点：预期卖出价 vs 实际成交价，正值=卖差了
+                    slip_pct = round((slip_ref - price) / slip_ref * 100, 3)
+                trade['slip_ref'] = round(slip_ref, 3)
+                trade['slip_pct'] = slip_pct
+            # 卖出时补充买入价和盈亏（此时 _remove_position 尚未执行，持仓仍存在）
+            if trade_type == 'sell':
+                pos = next((p for p in self.positions if p.get('code') == code), None)
+                if pos:
+                    buy_price = pos.get('buy_price', 0)
+                    if buy_price > 0:
+                        cost = buy_price * quantity
+                        pnl = round((price - buy_price) * quantity - fee, 2)
+                        pnl_pct = round(pnl / cost * 100, 3)
+                        trade['buy_price'] = round(buy_price, 3)
+                        trade['pnl'] = pnl
+                        trade['pnl_pct'] = pnl_pct
             log_path = os.path.join(os.path.dirname(__file__), '..', self.TRADES_LOG_FILE)
             trades = []
             if os.path.exists(log_path):

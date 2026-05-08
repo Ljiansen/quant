@@ -4,7 +4,7 @@
     "max_change_pct": 0.07,
     "hard_stop_loss": 0.03,
     "soft_stop_loss": 0.02,
-    "trailing_activate": 0.005,
+    "trailing_activate": 0.02,
     "trailing_stop": 0.01,
     "time_stop_days": 5,
     "take_profit": 0.05,
@@ -29,7 +29,7 @@
     "initial_capital": 300000
   },
   "_meta": {
-    "last_modified": "2026-05-05",
-    "modified_by": "multi_year_validation"
+    "last_modified": "2026-05-08",
+    "modified_by": "grid_search_4years_optimal_ta2_ts1"
   }
 }

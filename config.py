@@ -48,7 +48,7 @@ V3_MIN_CHANGE_PCT = 0.01        # 主板/创业板最低涨幅1%
 V3_HARD_STOP_LOSS = 0.03        # 硬止损3%（网格优化最优参数）
 V3_SOFT_STOP_LOSS = 0.02        # 阴跌止损2%（网格优化最优参数）
 V3_TAKE_PROFIT = 0.05           # 主板/创业板固定止盈5%（保留兼容，已被移动止盈替代）
-V3_TRAILING_ACTIVATE = 0.005    # 主板/创业板：浮盈超0.5%后激活移动止盈（多周期验证最优参数）
+V3_TRAILING_ACTIVATE = 0.02     # 主板/创业板：浮盈超2%后激活移动止盈（2022-2026四年鲁棒网格最优参数）
 V3_TRAILING_STOP = 0.01         # 主板/创业板：从最高价回撤1%触发卖出（网格优化最优参数）
 V3_TIME_STOP_DAYS = 5           # 时间止损天数
 V3_COMMISSION_RATE = 0.00025    # 佣金0.025%
@@ -76,7 +76,7 @@ V3_STAR_TIME_STOP_DAYS = 5      # 科创板时间止损5天
 V3_STAR_LIMIT_UP = 0.198        # 科创板涨停保护19.8%
 V3_MAX_CHANGE_PCT = 0.07        # 主板最大涨幅（超过此値视为追高，不买），回测最佳参数
 V3_STAR_MAX_CHANGE_PCT = 0.08   # 科创/创业板最大涨幅（超过此值视为追高，不买）
-V3_PREV_BAR_UP = True              # 买入时要求上一根5分钟K线非阴线（close >= open）
+V3_PREV_BAR_UP = False              # 买入时要求上一根5分钟K线非阴线（close >= open）
 
 # 明日调仓池5分钟K线预缓存目录（每日收盘后建池时下载，供次日实盘引擎兜底使用）
 V3_NEXT_POOL_5MIN_DIR = 'd:/miniqmt_quant/5min_next_pool'

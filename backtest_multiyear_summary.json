@@ -1,0 +1,62 @@
+{
+  "run_time": "2026-05-06 15:26:46",
+  "buy_price": "close",
+  "capital": 300000,
+  "params": {
+    "hard_stop": 0.03,
+    "soft_stop": 0.02,
+    "trailing_activate": 0.005,
+    "trailing_stop": 0.01,
+    "time_stop_days": 5
+  },
+  "results": [
+    {
+      "total_return": "+69.80",
+      "annual_return": "+72.79",
+      "max_drawdown": "24.91",
+      "sharpe": "1.608",
+      "n_trades": "653",
+      "win_rate": "45.94",
+      "profit_factor": "1.44",
+      "label": "2022",
+      "start": "20220101",
+      "end": "20221231"
+    },
+    {
+      "total_return": "+87.17",
+      "annual_return": "+91.08",
+      "max_drawdown": "19.91",
+      "sharpe": "2.118",
+      "n_trades": "620",
+      "win_rate": "46.45",
+      "profit_factor": "1.46",
+      "label": "2023",
+      "start": "20230101",
+      "end": "20231231"
+    },
+    {
+      "total_return": "+283.47",
+      "annual_return": "+300.89",
+      "max_drawdown": "19.66",
+      "sharpe": "3.615",
+      "n_trades": "676",
+      "win_rate": "50.59",
+      "profit_factor": "1.60",
+      "label": "2024",
+      "start": "20240101",
+      "end": "20241231"
+    },
+    {
+      "total_return": "+784.58",
+      "annual_return": "+449.08",
+      "max_drawdown": "19.68",
+      "sharpe": "4.305",
+      "n_trades": "662",
+      "win_rate": "54.08",
+      "profit_factor": "1.68",
+      "label": "2025~2026",
+      "start": "20250101",
+      "end": "20260430"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+total_return: 5.937945
+annual_return: 6.516098
+max_drawdown: 0.064746
+sharpe_ratio: 6.62503
+win_rate: 0.517308
+profit_loss_ratio: 1.986542
+total_trades: 520
+trading_days: 242
+sell_type_stats: {'hard_stop': {'count': 264, 'avg_pnl': -4895.8}, 'soft_stop': {'count': 21, 'avg_pnl': -10039.8}, 'trailing_stop': {'count': 235, 'avg_pnl': 13979.7}, 'time_stop': {'count': 0, 'avg_pnl': 0.0}}
+avg_holding_days: 1.31
+avg_profit_per_trade: 3426.74

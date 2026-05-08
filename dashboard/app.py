@@ -261,6 +261,36 @@ def _build_new_stock_cache_bg():
         _new_stock_loading = False
 
 
+def _backfill_pnl(trades):
+    """对历史卖出记录补算盈亏（处理旧数据未记录 pnl/buy_price 的情况）。
+    逻辑：对每条无 pnl 的卖出记录，向前扫描找到同一股票最近的买入记录来定价。
+    trades 已按时间倒序排序。
+    """
+    # 先恢复正序（时间升序）以便配对
+    ordered = sorted(trades, key=lambda x: x.get('timestamp', x.get('time', '')))
+    # buy_map: code -> 最近一次买入的 buy_price
+    buy_map = {}
+    for t in ordered:
+        ttype = t.get('type', t.get('action', t.get('direction', '')))
+        code = t.get('code', t.get('stock_code', ''))
+        if ttype == 'buy':
+            bp = t.get('price', 0)
+            if bp > 0:
+                buy_map[code] = bp
+        elif ttype == 'sell' and t.get('pnl') is None:
+            buy_price = t.get('buy_price') or buy_map.get(code)
+            if buy_price and buy_price > 0:
+                sell_price = t.get('price', 0)
+                qty = t.get('quantity', t.get('volume', 0))
+                fee = t.get('fee', t.get('commission', 0))
+                cost = buy_price * qty
+                pnl = round((sell_price - buy_price) * qty - fee, 2)
+                pnl_pct = round(pnl / cost * 100, 3) if cost > 0 else 0
+                t['buy_price'] = round(buy_price, 3)
+                t['pnl'] = pnl
+                t['pnl_pct'] = pnl_pct
+
+
 def _get_stock_name(code):
     """获取股票名称。优先序列：本地缓存 → xtquant → akshare"""
     bare = str(code).split('.')[0]
@@ -407,6 +437,8 @@ def create_app():
             for t in trades:
                 c = t.get('code', t.get('stock_code', ''))
                 t['name'] = _get_stock_name(c)
+            # 对历史卖出记录补算盈亏（兼容旧数据未记录 pnl 的情况）
+            _backfill_pnl(trades)
         return jsonify(trades)
 
     @app.route('/api/pool')
