@@ -303,7 +303,7 @@ def build_ba_pool(daily_data: dict, ref_date_str: str, all_trading_dates: list) 
 # ─── 主模拟引擎 ────────────────────────────────────────────────────────────────
 def run_simulation(start_date: str, end_date: str, initial_capital: float = 300_000.0,
                    fivemin_dir: str = None, extra_daily_dir: str = None,
-                   buy_price_mode: str = 'high', prev_bar_up: bool = PREV_BAR_UP,
+                   buy_price_mode: str = 'close', prev_bar_up: bool = PREV_BAR_UP,
                    no_open_30: bool = False, slippage: float = 0.0005):  # 默认0.05%滑点，对齐实盘路由加权均值成本
     """
     主入口：逐日逐根5分钟K线模拟完整交易逻辑。
