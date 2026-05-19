@@ -96,6 +96,9 @@ def get_all_local_codes() -> list[str]:
         for fname in os.listdir(subdir):
             if fname.startswith('price_') and fname.endswith('.csv'):
                 code = fname.replace('price_', '').replace('.csv', '')
+                # 跳过上证指数文件（sh000001），由 update_sh_index() 单独处理
+                if not code[0].isdigit():
+                    continue
                 if os.path.getsize(os.path.join(subdir, fname)) > 200:
                     codes.append(code)
     return sorted(codes)
@@ -211,6 +214,81 @@ def append_new_rows(code: str, new_df: pd.DataFrame) -> int:
 
     to_append.to_csv(path, mode='a', header=False, index=False)
     return len(to_append)
+
+
+# ──────────────────────────────────────────────────────────────
+# 上证指数专用更新
+# ──────────────────────────────────────────────────────────────
+
+SH_INDEX_FILE = os.path.join(SH_DIR, 'price_sh000001.csv')
+
+
+def update_sh_index(start_yyyymmdd: str, end_yyyymmdd: str) -> bool:
+    """
+    增量更新上证指数日线到 D:/daily_data/SH/price_sh000001.csv。
+    字段与普通股票 CSV 保持一致：timetag, open, high, low, close, volumn, amount
+    adjustflag='3'（指数不复权）
+    返回 True 表示有新数据写入，False 表示无新数据或失败。
+    """
+    import baostock as bs
+
+    def _fmt(d): return f'{d[:4]}-{d[4:6]}-{d[6:]}'
+    start = _fmt(start_yyyymmdd)
+    end   = _fmt(end_yyyymmdd)
+
+    for attempt in range(1, 4):
+        try:
+            _bs_ensure_login()
+            rs = bs.query_history_k_data_plus(
+                code='sh.000001',
+                fields='date,open,high,low,close,volume,amount',
+                start_date=start,
+                end_date=end,
+                frequency='d',
+                adjustflag='3',   # 指数不复权
+            )
+            if rs.error_code != '0':
+                raise RuntimeError(f'baostock 上证指数查询错误: {rs.error_msg}')
+
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+
+            if not rows:
+                log.info('上证指数: 无新数据')
+                return False
+
+            df = pd.DataFrame(rows, columns=rs.fields)
+            df['timetag'] = df['date'].str.replace('-', '', regex=False).astype(int)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            # 指数文件只保留 6 列，与原始文件格式保持一致（不含 amount/volumn）
+            df = df[['timetag', 'open', 'high', 'low', 'close', 'volume']].copy()
+
+            # 追加到文件（去重）
+            os.makedirs(SH_DIR, exist_ok=True)
+            if os.path.exists(SH_INDEX_FILE):
+                existing = pd.read_csv(SH_INDEX_FILE, usecols=['timetag'])
+                last_tag = int(existing['timetag'].max()) if not existing.empty else 0
+                df = df[df['timetag'] > last_tag]
+
+            if df.empty:
+                log.info('上证指数: 已是最新，无需追加')
+                return False
+
+            write_header = not os.path.exists(SH_INDEX_FILE)
+            df.to_csv(SH_INDEX_FILE, mode='a', header=write_header, index=False)
+            log.info(f'上证指数: 新增 {len(df)} 行，最新日期 {df["timetag"].max()}')
+            return True
+
+        except Exception as e:
+            global _bs_logged_in
+            _bs_logged_in = False
+            if attempt < 3:
+                time.sleep(1.0 * attempt + random.random())
+            else:
+                log.warning(f'上证指数更新失败（已重试3次）: {e}')
+    return False
 
 
 # ──────────────────────────────────────────────────────────────
@@ -373,6 +451,10 @@ def main():
     _bs_logout()
 
     log.info(f'增量更新完成: 成功={success} 跳过={skipped} 失败={failed}，耗时 {elapsed:.1f} 分钟')
+
+    # 上证指数单独更新
+    log.info('── 更新上证指数 ──')
+    update_sh_index(start_date, end_date)
 
     # 可选：添加新股
     if args.add_new:

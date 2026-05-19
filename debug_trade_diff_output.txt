@@ -1,0 +1,57 @@
+
+debug 生成5个详细文件
+python export_detailed_backtest.py 2026-01-02 2026-04-30
+python pack_debug_export.py 2026-01-02 2026-04-30
+
+debug 执行
+
+python debug_trade_diff.py 2026-01-02 2026-04-30
+
+执行回测
+python run_backtest_v4_weekly.py 2026-01-02 2026-04-30
+
+
+ python pack_code_for_mac.py
+
+
+
+
+
+开盘前（09:20 前到位）
+步骤	操作
+①	打开 miniQMT，确认登录成功、行情订阅正常
+②	终端1：python run_live_v4.py（主进程，会自动等待 9:25 开始）
+③	终端2：python run_dashboard.py（仪表盘，端口 8088）
+④	终端3（可选，远程访问）：cloudflared tunnel --url http://localhost:8088（输出的 trycloudflare.com 链接即为访问域名，每次启动不同）
+⑤	检查持仓状态：python run_live_v4.py --status（不连接 miniQMT，快速查看）
+
+
+盘中（09:30–15:00）
+无需人工干预，引擎自动执行过滤链 → 买入 → 移动止盈/硬止损
+通过 dashboard（http://localhost:8088 或 cloudflare 域名）监控持仓、候选股、交易记录
+
+
+收盘后（15:05 起全自动）
+
+
+15:05 主循环结束
+  → 等待至 19:00
+  → 调用 update_daily_data.py --force（更新 D:/daily_data）
+  → 调用 engine.postmarket_precompute（预算次日 BA pool）
+  → 打印收盘持仓状态后退出
+
+
+
+手动触发（如主进程被中断）：
+# 手动更新日线并重算 BA pool（19:00 后执行）
+python run_live_v4.py --precompute
+
+# 或单独重算指定日期的 BA pool
+python compute_ba_pool_v4.py 2026-04-30
+
+
+验证收盘后是否完成：
+
+# 看哨兵文件是否存在（YYYYMMDD 换成今日日期）
+Test-Path d:\miniqmt_quant\.v4_daily_update_done_20260430
+Test-Path d:\miniqmt_quant\.v4_ba_pool_done_20260430

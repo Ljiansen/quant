@@ -492,7 +492,8 @@ def run_simulation(start_date: str, end_date: str, initial_capital: float = 300_
                 # 硬止损
                 hard_price = buy_price * (1 - _hard_sl(code))
                 if bar['low'] <= hard_price:
-                    sell_price = max(hard_price, bar['open'])
+                    # 用触发K线的 close 作为卖出价，贴近真实成交（close可低于hard_price）
+                    sell_price = bar['close']
                     _execute_sell(code, pos, sell_price, 'hard_stop',
                                   day_str, trades, sell_type_stats)
                     cash += _sell_net(sell_price, pos['quantity'])[0]

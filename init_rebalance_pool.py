@@ -237,9 +237,35 @@ def main(strategy: str = 'ba'):
     lookback_start_date = trading_dates[lookback_start_idx]
     lookback_start_ymd  = lookback_start_date.replace('-', '')
 
-    print(f"  调仓日: {rebalance_date} (索引 {cur_idx})")
-    print(f"  回看 {config.V3_REBALANCE_LOOKBACK} 个交易日，起始: {lookback_start_date}")
+    # 下一个交易日（5min预缓存文件以"使用日"命名，避免与"计算日"混淆）
+    if cur_idx + 1 < len(trading_dates):
+        next_trade_date     = trading_dates[cur_idx + 1]
+        next_trade_date_ymd = next_trade_date.replace('-', '')
+    else:
+        # 日历末尾：用自然日往后推，跳过周末和节假日（baostock 交易日历补全）
+        from datetime import timedelta as _td
+        import baostock as _bs_cal
+        _bs_cal.login()
+        _check = pd.to_datetime(rebalance_date) + _td(days=1)
+        next_trade_date = None
+        for _ in range(10):
+            _ds = _check.strftime('%Y-%m-%d')
+            _rs = _bs_cal.query_trade_dates(start_date=_ds, end_date=_ds)
+            if _rs.next():
+                _row = _rs.get_row_data()
+                if _row[1] == '1':   # is_trading_day
+                    next_trade_date = _ds
+                    break
+            _check += _td(days=1)
+        _bs_cal.logout()
+        if next_trade_date is None:
+            next_trade_date = rebalance_date   # 极端兜底
+        next_trade_date_ymd = next_trade_date.replace('-', '')
 
+    print(f"  调仓日: {rebalance_date} (索引 {cur_idx})")
+    print(f"  下一交易日: {next_trade_date}（5min预缓存将以此日期命名）")
+    print(f"  回看 {config.V3_REBALANCE_LOOKBACK} 个交易日，起始: {lookback_start_date}")
+    
     # 2. 获取所有股票代码并过滤
     print("\n[2/4] 获取股票列表并过滤...")
     all_codes = get_all_stock_codes(data_dir)
@@ -371,6 +397,16 @@ def main(strategy: str = 'ba'):
         'max_chg':         max_chg,
     }
     output_path = 'd:/miniqmt_quant/state_v3_rebalance.json'
+
+    # ── 在写入新池之前，先读取旧池（否则写入后读到的是新池，对比失效）──────────
+    _old_pool = []
+    try:
+        if os.path.exists(output_path):
+            with open(output_path, 'r', encoding='utf-8') as _f:
+                _old_pool = json.load(_f).get('pool', [])
+    except Exception as _e:
+        print(f"[建池后置] 读取旧调仓池失败({_e})，跳过旧池5min存档")
+
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
@@ -401,23 +437,16 @@ def main(strategy: str = 'ba'):
     next_pool_dir = getattr(config, 'V3_NEXT_POOL_5MIN_DIR', 'd:/miniqmt_quant/5min_next_pool')
 
     # ── 步骤A：保存旧调仓池今日5min数据（回测存档）──────────────────────────────
-    # 读取即将被覆盖的旧池子，下载它们今天的5分钟K线
-    # 与新池子重叠的股票会被覆盖写入，内容相同，无影响
-    _old_pool = []
-    try:
-        if os.path.exists(output_path):
-            with open(output_path, 'r', encoding='utf-8') as _f:
-                _old_pool = json.load(_f).get('pool', [])
-    except Exception as _e:
-        print(f"[建池后置] 读取旧调仓池失败({_e})，跳过旧池5min存档")
+    # 旧池已在写文件前读取（_old_pool），此处直接使用
     if _old_pool:
         _old_only = [c for c in _old_pool if c not in pool]
         print(f"[建池后置] 旧调仓池{len(_old_pool)}只，其中{len(_old_only)}只不在新池（退出股票），存档其今日5min数据")
-        download_pool_5min_today(_old_pool, next_pool_dir, rebalance_date_ymd)
+        download_pool_5min_today(_old_pool, next_pool_dir, next_trade_date_ymd)
 
     # ── 步骤B：下载新调仓池今日5min数据（供次日实盘引擎兜底）────────────────────
-    # 供次日实盘引擎对新入池股票（miniQMT无历史bar）的兜底使用
-    download_pool_5min_today(pool, next_pool_dir, rebalance_date_ymd)
+    # 文件名使用下一交易日日期（即实盘实际使用日），避免与计算日混淆
+    print(f"[建池后置] 5min预缓存文件日期: {next_trade_date}（下一交易日，实盘使用日）")
+    download_pool_5min_today(pool, next_pool_dir, next_trade_date_ymd)
 
 
 if __name__ == '__main__':

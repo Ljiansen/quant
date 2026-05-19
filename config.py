@@ -45,12 +45,12 @@ LOG_LEVEL = 'INFO'
 V3_TOP_N = 50                    # 选股池大小（综合排名前N）
 V3_MAX_POSITIONS = 3             # 最大持仓数
 V3_MIN_CHANGE_PCT = 0.01        # 主板/创业板最低涨幅1%
-V3_HARD_STOP_LOSS = 0.03        # 硬止损3%（网格优化最优参数）
-V3_SOFT_STOP_LOSS = 0.02        # 阴跌止损2%（网格优化最优参数）
+V3_HARD_STOP_LOSS = 0.05        # 硬止损5%
+V3_SOFT_STOP_LOSS = 0.02        # 软止损2%（阴线+跌幅>X%时次日卖出）
+V3_TIME_STOP_DAYS = 5           # 时间止损：持仓超过N个交易日无盈利则卖出
 V3_TAKE_PROFIT = 0.05           # 主板/创业板固定止盈5%（保留兼容，已被移动止盈替代）
-V3_TRAILING_ACTIVATE = 0.02     # 主板/创业板：浮盈超2%后激活移动止盈（2022-2026四年鲁棒网格最优参数）
-V3_TRAILING_STOP = 0.01         # 主板/创业板：从最高价回撤1%触发卖出（网格优化最优参数）
-V3_TIME_STOP_DAYS = 5           # 时间止损天数
+V3_TRAILING_ACTIVATE = 0.15     # 主板/创业板：浮盈超15%后激活移动止盈
+V3_TRAILING_STOP = 0.05         # 主板/创业板：从最高价回撤5%触发卖出
 V3_COMMISSION_RATE = 0.00025    # 佣金0.025%
 V3_MIN_COMMISSION = 5           # 最低佣金5元
 V3_STAMP_TAX_RATE = 0.0005      # 印花税0.05%
@@ -65,17 +65,21 @@ V3_REBALANCE_LOOKBACK = 120     # 回看交易日数（约6个月）
 V3_DAILY_MIN_AMOUNT = 500000000 # 近N天日均成交额最低5亿
 V3_DAILY_AMOUNT_DAYS = 10       # 日均成交额回看天数
 
+# 过热过滤参数（调仓池冷却机制）
+V3_OVERHEAT_LOOKBACK  = 20      # 过热检测回看交易日数
+V3_OVERHEAT_THRESHOLD = 0.40    # 过热阈值：最近N日累计涨幅超过此值则当日不买
+
 # ===== 科创板独立参数 =====
-V3_STAR_MIN_CHANGE_PCT = 0.02   # 科创板买入最低涨幅2%
+V3_STAR_MIN_CHANGE_PCT = 0.01   # 科创/创业板买入最低涨幅1%
 V3_STAR_TAKE_PROFIT = 0.15      # 科创板止盈15%（保留兼容，已被移动止盈替代）
-V3_STAR_TRAILING_ACTIVATE = 0.08  # 科创板：浮盈超8%后激活移动止盈
-V3_STAR_TRAILING_STOP = 0.05    # 科创板：从最高价回撤5%触发卖出（网格优化最优参数）
-V3_STAR_HARD_STOP_LOSS = 0.03   # 科创板硬止损3%（网格优化最优参数）
-V3_STAR_SOFT_STOP_LOSS = 0.02   # 科创板阴跌止损2%（网格优化最优参数）
-V3_STAR_TIME_STOP_DAYS = 5      # 科创板时间止损5天
+V3_STAR_TRAILING_ACTIVATE = 0.15  # 科创板：浮盈超15%后激活移动止盈
+V3_STAR_TRAILING_STOP = 0.05    # 科创板：从最高价回撤5%触发卖出
+V3_STAR_HARD_STOP_LOSS = 0.05   # 科创板/创业板硬止损5%
+V3_STAR_SOFT_STOP_LOSS = 0.02   # 科创板/创业板软止损2%
+V3_STAR_TIME_STOP_DAYS = 5      # 科创板/创业板时间止损天数
 V3_STAR_LIMIT_UP = 0.198        # 科创板涨停保护19.8%
-V3_MAX_CHANGE_PCT = 0.07        # 主板最大涨幅（超过此値视为追高，不买），回测最佳参数
-V3_STAR_MAX_CHANGE_PCT = 0.08   # 科创/创业板最大涨幅（超过此值视为追高，不买）
+V3_MAX_CHANGE_PCT = 0.03        # 主板最大涨幅（超过此值视为追高，不买）
+V3_STAR_MAX_CHANGE_PCT = 0.06   # 科创/创业板最大涨幅（超过此值视为追高，不买）
 V3_PREV_BAR_UP = False              # 买入时要求上一根5分钟K线非阴线（close >= open）
 
 # 明日调仓池5分钟K线预缓存目录（每日收盘后建池时下载，供次日实盘引擎兜底使用）

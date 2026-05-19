@@ -150,13 +150,9 @@ class LiveEngineV3:
         # 策略参数（从 config 读取）
         self.max_positions = config.V3_MAX_POSITIONS  # 最大持仓3只
         self.hard_stop_loss = config.V3_HARD_STOP_LOSS
-        self.soft_stop_loss = config.V3_SOFT_STOP_LOSS
         self.take_profit = config.V3_TAKE_PROFIT
-        self.time_stop_days = config.V3_TIME_STOP_DAYS
         self.star_hard_stop_loss = config.V3_STAR_HARD_STOP_LOSS
-        self.star_soft_stop_loss = config.V3_STAR_SOFT_STOP_LOSS
         self.star_take_profit = config.V3_STAR_TAKE_PROFIT
-        self.star_time_stop_days = config.V3_STAR_TIME_STOP_DAYS
         # 移动止盈参数
         self.trailing_activate = config.V3_TRAILING_ACTIVATE
         self.trailing_stop = config.V3_TRAILING_STOP
@@ -208,6 +204,10 @@ class LiveEngineV3:
 
         # 调仓池文件修改时间（用于热重载检测）
         self._rebalance_pool_mtime = 0.0
+
+        # 过热过滤缓存：{code: bool}，按日重置
+        self._overheat_cache = {}
+        self._overheat_cache_date = ''
 
         # 条件单记录：{code: condition_order_id}
         # 保存每只持仓股票在制券商服务器端挂起的止损条件单ID
@@ -261,19 +261,15 @@ class LiveEngineV3:
             # 主板
             if 'min_change_pct'    in _m: self.min_change_pct       = float(_m['min_change_pct'])
             if 'hard_stop_loss'    in _m: self.hard_stop_loss        = float(_m['hard_stop_loss'])
-            if 'soft_stop_loss'    in _m: self.soft_stop_loss        = float(_m['soft_stop_loss'])
             if 'trailing_activate' in _m: self.trailing_activate     = float(_m['trailing_activate'])
             if 'trailing_stop'     in _m: self.trailing_stop         = float(_m['trailing_stop'])
-            if 'time_stop_days'    in _m: self.time_stop_days        = int(_m['time_stop_days'])
             if 'limit_up'          in _m: self.limit_up              = float(_m['limit_up'])
             if 'max_change_pct'    in _m: self.max_change_pct        = float(_m['max_change_pct'])
             # 科创/创业板
             if 'min_change_pct'    in _s: self.star_min_change_pct   = float(_s['min_change_pct'])
             if 'hard_stop_loss'    in _s: self.star_hard_stop_loss   = float(_s['hard_stop_loss'])
-            if 'soft_stop_loss'    in _s: self.star_soft_stop_loss   = float(_s['soft_stop_loss'])
             if 'trailing_activate' in _s: self.star_trailing_activate = float(_s['trailing_activate'])
             if 'trailing_stop'     in _s: self.star_trailing_stop    = float(_s['trailing_stop'])
-            if 'time_stop_days'    in _s: self.star_time_stop_days   = int(_s['time_stop_days'])
             if 'limit_up'          in _s: self.star_limit_up         = float(_s['limit_up'])
             if 'max_change_pct'    in _s: self.star_max_change_pct   = float(_s['max_change_pct'])
         except FileNotFoundError:
@@ -1519,19 +1515,12 @@ class LiveEngineV3:
                 continue
 
             is_star = self._is_star(code)
-            soft_sl = self.star_soft_stop_loss if is_star else self.soft_stop_loss
-            time_stop = self.star_time_stop_days if is_star else self.time_stop_days
             trail_act = self.star_trailing_activate if is_star else self.trailing_activate
             trail_pct = self.star_trailing_stop    if is_star else self.trailing_stop
 
             sell_type = None
 
-            # 1. 阴跌止损
-            soft_stop_price = buy_price * (1 - soft_sl)
-            if last_price < soft_stop_price and last_price < open_price:
-                sell_type = 'soft_stop'
-
-            # 2. 移动止盈：导盘最高价激活后，收盘价跳止进回撤线则 pending
+            # 移动止盈：最高价激活后，收盘价触达回撤线则 pending
             if sell_type is None:
                 highest_price = pos.get('highest_price', buy_price)
                 if highest_price >= buy_price * (1 + trail_act):
@@ -1539,10 +1528,7 @@ class LiveEngineV3:
                     if last_price <= trail_trigger:
                         sell_type = 'trailing_stop'
 
-            # 3. 时间止损
-            if sell_type is None and days_held >= time_stop and last_price <= buy_price:
-                sell_type = 'time_stop'
-
+            # 时间止损已移除
             if sell_type:
                 # 检查是否已在 pending_sells 中
                 already_pending = any(
@@ -2167,6 +2153,25 @@ class LiveEngineV3:
         if not candidates:
             return []
 
+        # 过热过滤：最近20交易日累计涨幅超过40%的股票当日不买
+        _today_str = date.today().strftime('%Y%m%d')
+        if self._overheat_cache_date != _today_str:
+            self._overheat_cache.clear()
+            self._overheat_cache_date = _today_str
+        _overheat_excluded = []
+        _clean = []
+        for _c in candidates:
+            _bare = _strip_suffix(_c)
+            if self._is_overheat(_bare):
+                _overheat_excluded.append(_bare)
+            else:
+                _clean.append(_c)
+        if _overheat_excluded:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [过热过滤] 排除{len(_overheat_excluded)}只: {_overheat_excluded}")
+        candidates = _clean
+        if not candidates:
+            return []
+
         # 日均成交额过滤（暂时注释：建池阶段未过滤，盘中二次过滤暂停用）
         # today_str = date.today().strftime('%Y-%m-%d')
         # if self._daily_filter_date != today_str or not self._daily_filter_cache:
@@ -2332,6 +2337,51 @@ class LiveEngineV3:
         """判断是否科创板(688开头)或创业板(30开头)"""
         code_str = str(code).split('.')[0]
         return code_str.startswith('688') or code_str.startswith('30')
+
+    def _is_overheat(self, code: str) -> bool:
+        """判断股票是否过热：最近 V3_OVERHEAT_LOOKBACK 个交易日累计涨幅超过 V3_OVERHEAT_THRESHOLD
+
+        使用 xtdata 获取日线数据，缓存当日结果。
+        失败时默认放行（不阻断交易）。
+        """
+        if code in self._overheat_cache:
+            return self._overheat_cache[code]
+
+        lookback  = getattr(config, 'V3_OVERHEAT_LOOKBACK',  20)
+        threshold = getattr(config, 'V3_OVERHEAT_THRESHOLD', 0.40)
+
+        try:
+            from xtquant import xtdata as _xtd_d
+            import numpy as _np_oh
+            symbol = _format_symbol(code)
+            kd = _xtd_d.get_market_data(
+                field_list=['close'],
+                stock_list=[symbol],
+                period='1d',
+                count=lookback + 1
+            )
+            closes_df = kd.get('close') if kd else None
+            if closes_df is None or symbol not in closes_df.index:
+                self._overheat_cache[code] = False
+                return False
+            closes = closes_df.loc[symbol].values.astype(float)
+            closes = closes[~_np_oh.isnan(closes)]
+            if len(closes) < 2:
+                self._overheat_cache[code] = False
+                return False
+            base    = float(closes[0])
+            current = float(closes[-1])
+            cumret  = (current - base) / base if base > 0 else 0.0
+            is_hot  = cumret >= threshold
+            self._overheat_cache[code] = is_hot
+            if is_hot:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [过热] {code} "
+                      f"近{lookback}日累计涨幅 {cumret:.1%} >= {threshold:.0%}，当日不买")
+            return is_hot
+        except Exception as _e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [{code}] 过热检查失败({_e})，默认放行")
+            self._overheat_cache[code] = False
+            return False
 
     # ------------------------------------------------------------------
     # 交易日志记录

@@ -1,23 +1,19 @@
 {
   "main_board": {
     "min_change_pct": 0.01,
-    "max_change_pct": 0.07,
-    "hard_stop_loss": 0.03,
-    "soft_stop_loss": 0.02,
-    "trailing_activate": 0.02,
-    "trailing_stop": 0.01,
-    "time_stop_days": 5,
+    "max_change_pct": 0.03,
+    "hard_stop_loss": 0.05,
+    "trailing_activate": 0.15,
+    "trailing_stop": 0.05,
     "take_profit": 0.05,
     "limit_up": 0.098
   },
   "star_board": {
-    "min_change_pct": 0.02,
-    "max_change_pct": 0.08,
-    "hard_stop_loss": 0.03,
-    "soft_stop_loss": 0.02,
-    "trailing_activate": 0.08,
+    "min_change_pct": 0.01,
+    "max_change_pct": 0.06,
+    "hard_stop_loss": 0.05,
+    "trailing_activate": 0.15,
     "trailing_stop": 0.05,
-    "time_stop_days": 5,
     "take_profit": 0.15,
     "limit_up": 0.198
   },
@@ -29,7 +25,7 @@
     "initial_capital": 300000
   },
   "_meta": {
-    "last_modified": "2026-05-08",
-    "modified_by": "grid_search_4years_optimal_ta2_ts1"
+    "last_modified": "2026-04-30",
+    "modified_by": "unified_hard5_trailing15_5"
   }
 }

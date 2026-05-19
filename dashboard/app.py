@@ -30,8 +30,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 监控的进程配置
 PROCESS_TARGETS = {
-    'sim':  'run_simulation_v3.py',
-    'live': 'run_live_v3.py',
+    'live': 'run_live_v4.py',
 }
 
 # 已启动的进程句柄 {mode: Popen}
@@ -39,6 +38,66 @@ _launched_procs = {}
 
 # params_v3.json 路径（动态参数配置文件）
 _PARAMS_FILE = os.path.join(BASE_DIR, 'params_v3.json')
+
+# 过热过滤缓存（按日重置，避免每次 API 请求都读磁盘）
+_overheat_cache: dict = {}
+_overheat_cache_date: str = ''
+
+
+def _check_overheat_local(bare_code: str) -> tuple:
+    """从本地日线 CSV 判断股票是否过热
+    返回 (is_overheat: bool, reason: str)
+    """
+    global _overheat_cache, _overheat_cache_date
+    import pandas as _pd_oh
+
+    # 加载参数
+    lookback  = 20
+    threshold = 0.40
+    try:
+        sys.path.insert(0, BASE_DIR)
+        import config as _cfg_oh
+        lookback  = getattr(_cfg_oh, 'V3_OVERHEAT_LOOKBACK',  lookback)
+        threshold = getattr(_cfg_oh, 'V3_OVERHEAT_THRESHOLD', threshold)
+    except Exception:
+        pass
+
+    # 按日重置缓存
+    today_str = _dt_now.today().strftime('%Y%m%d')
+    if _overheat_cache_date != today_str:
+        _overheat_cache.clear()
+        _overheat_cache_date = today_str
+
+    if bare_code in _overheat_cache:
+        return _overheat_cache[bare_code]
+
+    sub   = 'SH' if bare_code.startswith('6') else 'SZ'
+    fpath = os.path.join('D:/daily_data', sub, f'price_{bare_code}.csv')
+    if not os.path.exists(fpath):
+        _overheat_cache[bare_code] = (False, '')
+        return False, ''
+    try:
+        df = _pd_oh.read_csv(fpath, usecols=['timetag', 'close'])
+        df = df.sort_values('timetag').tail(lookback + 1).reset_index(drop=True)
+        closes = df['close'].astype(float).values
+        if len(closes) < 2:
+            _overheat_cache[bare_code] = (False, '')
+            return False, ''
+        base    = float(closes[0])
+        current = float(closes[-1])
+        if base <= 0:
+            _overheat_cache[bare_code] = (False, '')
+            return False, ''
+        cumret = (current - base) / base
+        if cumret >= threshold:
+            reason = f'近{lookback}日累计涨幅{cumret*100:.1f}%，超过{threshold*100:.0f}%冷却阈值'
+            _overheat_cache[bare_code] = (True, reason)
+            return True, reason
+        _overheat_cache[bare_code] = (False, '')
+        return False, ''
+    except Exception:
+        _overheat_cache[bare_code] = (False, '')
+        return False, ''
 
 # 模拟结果存档目录
 SIM_RESULTS_DIR = os.path.join(BASE_DIR, 'sim_results')
@@ -49,20 +108,16 @@ _PARAM_RANGES = {
         'min_change_pct':    (0.001, 0.20),
         'max_change_pct':    (0.01,  0.50),
         'hard_stop_loss':    (0.01,  0.50),
-        'soft_stop_loss':    (0.005, 0.30),
         'trailing_activate': (0.005, 0.50),
         'trailing_stop':     (0.005, 0.30),
-        'time_stop_days':    (1,     60),
         'limit_up':          (0.05,  0.22),
     },
     'star_board': {
         'min_change_pct':    (0.001, 0.20),
         'max_change_pct':    (0.01,  0.50),
         'hard_stop_loss':    (0.01,  0.50),
-        'soft_stop_loss':    (0.005, 0.30),
         'trailing_activate': (0.005, 0.50),
         'trailing_stop':     (0.005, 0.30),
-        'time_stop_days':    (1,     60),
         'limit_up':          (0.05,  0.22),
     },
     'general': {
@@ -330,15 +385,23 @@ def create_app():
             pass
         return None
 
+    def _get_latest_ba_pool():
+        """读取最新的 ba_pool_v4_{date}.json，返回 dict 或 None"""
+        import glob as _glob
+        pattern = os.path.join(BASE_DIR, 'ba_pool_v4_*.json')
+        files = sorted(_glob.glob(pattern), reverse=True)
+        for fpath in files:
+            d = _read_json(fpath)
+            if d is not None:
+                return d
+        return None
+
     def _get_state_file(mode):
-        if mode == 'live':
-            return os.path.join(BASE_DIR, 'state_v3.json')
-        return os.path.join(BASE_DIR, 'state_v3_sim.json')
+        # V4 只有实盘模式
+        return os.path.join(BASE_DIR, 'state_v4.json')
 
     def _get_trades_file(mode):
-        if mode == 'live':
-            return os.path.join(BASE_DIR, 'trades_v3.json')
-        return os.path.join(BASE_DIR, 'trades_v3_sim.json')
+        return os.path.join(BASE_DIR, 'trades_v4.json')
 
     @app.route('/')
     def index():
@@ -372,8 +435,12 @@ def create_app():
         cash = state.get('cash', 0)
         # profit / profit_pct 将在获取实时持仓价格后重新计算
 
-        positions = state.get('positions', [])
+        positions = state.get('positions', {})
         pending_sells = state.get('pending_sells', [])
+
+        # V4: positions 是 dict {code: {...}}，归一化为 list
+        if isinstance(positions, dict):
+            positions = [{'code': k, **v} for k, v in positions.items()]
 
         # 为持仓添加名称，并获取实时价格计算盈亏%
         pos_codes = [p.get('code', p.get('stock_code', '')) for p in positions]
@@ -443,35 +510,35 @@ def create_app():
 
     @app.route('/api/pool')
     def api_pool():
-        pool = _read_json(os.path.join(BASE_DIR, 'state_v3_rebalance.json'))
-        if pool is None:
-            pool = {}
-        return jsonify(pool)
+        d = _get_latest_ba_pool()
+        if d is None:
+            return jsonify({})
+        pool_list = [
+            {'code': item[0], 'rank': item[1], 'score': round(float(item[2]), 4)}
+            for item in d.get('pool', [])
+            if isinstance(item, (list, tuple)) and len(item) >= 3
+        ]
+        return jsonify({
+            'strategy':       'V4 BA',
+            'rebalance_date': d.get('ref_date', ''),
+            'pool':           pool_list,
+            'count':          d.get('count', len(pool_list)),
+        })
 
     @app.route('/api/pool/status')
     def api_pool_status():
         """Return current pool strategy and rebuild status"""
-        pool = _read_json(os.path.join(BASE_DIR, 'state_v3_rebalance.json')) or {}
-        s_key = pool.get('strategy_key', '')
-        if not s_key:
-            # 尝试从策略名称推断
-            sname = str(pool.get('strategy', ''))
-            if 'B+A' in sname or 'ba' in sname.lower():
-                s_key = 'ba'
-            elif 'A' in sname and 'B' not in sname:
-                s_key = 'a'
-            elif 'B' in sname and 'A' not in sname:
-                s_key = 'b'
-            else:
-                s_key = 'ba'
+        d         = _get_latest_ba_pool()
+        ref_date  = d.get('ref_date', '') if d else ''
+        pool_size = (d.get('count') or len(d.get('pool', []))) if d else 0
         return jsonify({
-            'strategy':        s_key,
-            'strategy_name':   pool.get('strategy', ''),
-            'rebalance_date':  pool.get('rebalance_date', ''),
-            'pool_size':       len(pool.get('pool', [])),
-            'rebuilding':      _pool_rebuild_state['running'],
-            'last_msg':        _pool_rebuild_state['msg'],
-            'last_rebuild':    _pool_rebuild_state['last_rebuild'],
+            'strategy':       'ba',
+            'strategy_name':  'V4 BA',
+            'rebalance_date': ref_date,
+            'pool_size':      pool_size,
+            'rebuilding':     _pool_rebuild_state['running'],
+            'last_msg':       _pool_rebuild_state['msg'],
+            'last_rebuild':   _pool_rebuild_state['last_rebuild'],
         })
 
     @app.route('/api/pool/rebuild', methods=['POST'])
@@ -514,14 +581,19 @@ def create_app():
 
     @app.route('/api/candidates')
     def api_candidates():
-        mode = request.args.get('mode', 'sim')
+        mode = request.args.get('mode', 'live')
         state = _read_json(_get_state_file(mode))
-        pool = _read_json(os.path.join(BASE_DIR, 'state_v3_rebalance.json'))
+        d = _get_latest_ba_pool()
 
         positions = []
         pending_sells = []
         if state:
-            positions = state.get('positions', [])
+            pos_raw = state.get('positions', {})
+            # V4: positions 是 dict {code: {...}}，归一化为 list
+            if isinstance(pos_raw, dict):
+                positions = [{'code': k, **v} for k, v in pos_raw.items()]
+            else:
+                positions = pos_raw
             pending_sells = state.get('pending_sells', [])
 
         # 当前持仓代码集合
@@ -531,19 +603,20 @@ def create_app():
             if code:
                 held_codes.add(str(code).split('.')[0])
 
-        # 候选（调仓池中未持仓的股票，保留池子原始排名=score降序）
-        raw_candidates = []  # list of (rank, bare_code)
-        if pool:
-            pool_stocks = pool.get('pool', pool.get('stocks', []))
-            if isinstance(pool_stocks, list):
-                for rank, item in enumerate(pool_stocks):
-                    if isinstance(item, dict):
-                        code = item.get('code', item.get('stock_code', ''))
-                    else:
-                        code = str(item)
-                    bare = code.split('.')[0] if code else ''
-                    if bare and bare not in held_codes:
-                        raw_candidates.append((rank, bare))
+        # 候选（V4 BA池，pool 格式为 [[code, rank, score], ...]）
+        raw_candidates = []  # list of (seq_rank, bare_code)
+        if d:
+            pool_stocks = d.get('pool', [])
+            for seq_rank, item in enumerate(pool_stocks):
+                if isinstance(item, (list, tuple)) and len(item) >= 1:
+                    code = str(item[0])
+                elif isinstance(item, dict):
+                    code = item.get('code', item.get('stock_code', ''))
+                else:
+                    code = str(item)
+                bare = code.split('.')[0] if code else ''
+                if bare and bare not in held_codes:
+                    raw_candidates.append((seq_rank, bare))
 
         # 获取实时行情
         tick_map = _get_tick_data([bare for _, bare in raw_candidates])
@@ -551,6 +624,8 @@ def create_app():
         candidates = []
         for rank, bare in raw_candidates:
             board_name, threshold, limit_up = _get_board_info(bare)
+            # 过热检查（从本地日线 CSV 读取）
+            _is_hot, _hot_reason = _check_overheat_local(bare)
             item = {
                 'code': bare,
                 'name': _get_stock_name(bare),
@@ -563,11 +638,13 @@ def create_app():
                 'change_pct': None,
                 'is_positive': None,
                 'meets_buy_condition': False,
-                'status': '无行情',
+                'status': '过热' if _is_hot else '无行情',
                 'pool_rank': rank,      # 池子原始排名（0=最高分）
+                'is_overheat': _is_hot,
+                'overheat_reason': _hot_reason,
             }
             tick = tick_map.get(bare)
-            if tick:
+            if tick and not _is_hot:
                 try:
                     last_price = tick.get('lastPrice') or tick.get('last_price') or 0
                     pre_close  = tick.get('lastClose') or tick.get('pre_close') or tick.get('preClose') or 0
@@ -604,6 +681,26 @@ def create_app():
                     })
                 except Exception:
                     pass
+            elif tick and _is_hot:
+                # 过热时仍返回行情数据，但 meets_buy_condition=False 且 status=过热
+                try:
+                    last_price = tick.get('lastPrice') or tick.get('last_price') or 0
+                    pre_close  = tick.get('lastClose') or tick.get('pre_close') or tick.get('preClose') or 0
+                    open_price = tick.get('open') or 0
+                    if pre_close and pre_close > 0:
+                        change_pct = (last_price - pre_close) / pre_close * 100
+                    else:
+                        change_pct = 0.0
+                    item.update({
+                        'last_price': round(last_price, 3),
+                        'pre_close':  round(pre_close, 3),
+                        'open':       round(open_price, 3),
+                        'change_pct': round(change_pct, 2),
+                        'meets_buy_condition': False,
+                        'status': '过热'
+                    })
+                except Exception:
+                    pass
             candidates.append(item)
 
         # 排序：按池子原始排名（= quality_score 降序），保持选股优先级
@@ -618,75 +715,24 @@ def create_app():
     @app.route('/api/config', methods=['GET', 'POST'])
     def api_config():
         if request.method == 'POST':
-            # 参数调整功能已禁用（请直接修改 config.py 并重启进程）
-            return jsonify({'ok': False, 'msg': '参数调整功能已禁用，请直接修改 config.py'}), 403
-        # GET: 优先读 params_v3.json，回退到 config.py
+            return jsonify({'ok': False, 'msg': '参数调整功能已禁用，请直接修改 live_engine_v4.py'}), 403
+        # GET: 读取 V4 引擎关键参数
         try:
-            if os.path.exists(_PARAMS_FILE):
-                with open(_PARAMS_FILE, 'r', encoding='utf-8') as _rf:
-                    data = json.load(_rf)
-                # 确保包含所有字段（就选从 config.py 补充缺失项）
-                try:
-                    import config as cfg
-                    _m = data.setdefault('main_board', {})
-                    _s = data.setdefault('star_board', {})
-                    _g = data.setdefault('general', {})
-                    _m.setdefault('min_change_pct', getattr(cfg, 'V3_MIN_CHANGE_PCT', 0.01))
-                    _m.setdefault('max_change_pct', getattr(cfg, 'V3_MAX_CHANGE_PCT', 0.05))
-                    _m.setdefault('trailing_activate', getattr(cfg, 'V3_TRAILING_ACTIVATE', 0.03))
-                    _m.setdefault('trailing_stop', getattr(cfg, 'V3_TRAILING_STOP', 0.02))
-                    _m.setdefault('hard_stop_loss', getattr(cfg, 'V3_HARD_STOP_LOSS', 0.05))
-                    _m.setdefault('soft_stop_loss', getattr(cfg, 'V3_SOFT_STOP_LOSS', 0.03))
-                    _m.setdefault('time_stop_days', getattr(cfg, 'V3_TIME_STOP_DAYS', 5))
-                    _m.setdefault('limit_up', 0.098)
-                    _s.setdefault('min_change_pct', getattr(cfg, 'V3_STAR_MIN_CHANGE_PCT', 0.02))
-                    _s.setdefault('max_change_pct', getattr(cfg, 'V3_STAR_MAX_CHANGE_PCT', 0.08))
-                    _s.setdefault('trailing_activate', getattr(cfg, 'V3_STAR_TRAILING_ACTIVATE', 0.08))
-                    _s.setdefault('trailing_stop', getattr(cfg, 'V3_STAR_TRAILING_STOP', 0.05))
-                    _s.setdefault('hard_stop_loss', getattr(cfg, 'V3_STAR_HARD_STOP_LOSS', 0.05))
-                    _s.setdefault('soft_stop_loss', getattr(cfg, 'V3_STAR_SOFT_STOP_LOSS', 0.03))
-                    _s.setdefault('time_stop_days', getattr(cfg, 'V3_STAR_TIME_STOP_DAYS', 5))
-                    _s.setdefault('limit_up', getattr(cfg, 'V3_STAR_LIMIT_UP', 0.198))
-                    _g.setdefault('top_n', getattr(cfg, 'V3_TOP_N', 50))
-                    _g.setdefault('max_positions', getattr(cfg, 'V3_MAX_POSITIONS', 3))
-                    _g.setdefault('prev_bar_up', int(getattr(cfg, 'V3_PREV_BAR_UP', False)))
-                    _g.setdefault('initial_capital', getattr(cfg, 'V3_INITIAL_CAPITAL', 300000))
-                except Exception:
-                    pass
-                return jsonify(data)
-        except Exception:
-            pass
-        # 完全回退到 config.py
-        try:
-            import config as cfg
+            from engine import live_engine_v4 as _v4
             data = {
-                'main_board': {
-                    'min_change_pct':    getattr(cfg, 'V3_MIN_CHANGE_PCT', 0.01),
-                    'max_change_pct':    getattr(cfg, 'V3_MAX_CHANGE_PCT', 0.05),
-                    'hard_stop_loss':    getattr(cfg, 'V3_HARD_STOP_LOSS', 0.05),
-                    'soft_stop_loss':    getattr(cfg, 'V3_SOFT_STOP_LOSS', 0.03),
-                    'time_stop_days':    getattr(cfg, 'V3_TIME_STOP_DAYS', 5),
-                    'limit_up':          0.098,
-                    'trailing_activate': getattr(cfg, 'V3_TRAILING_ACTIVATE', 0.03),
-                    'trailing_stop':     getattr(cfg, 'V3_TRAILING_STOP', 0.02),
-                },
-                'star_board': {
-                    'min_change_pct':    getattr(cfg, 'V3_STAR_MIN_CHANGE_PCT', 0.02),
-                    'max_change_pct':    getattr(cfg, 'V3_STAR_MAX_CHANGE_PCT', 0.08),
-                    'hard_stop_loss':    getattr(cfg, 'V3_STAR_HARD_STOP_LOSS', 0.05),
-                    'soft_stop_loss':    getattr(cfg, 'V3_STAR_SOFT_STOP_LOSS', 0.03),
-                    'time_stop_days':    getattr(cfg, 'V3_STAR_TIME_STOP_DAYS', 5),
-                    'limit_up':          getattr(cfg, 'V3_STAR_LIMIT_UP', 0.198),
-                    'trailing_activate': getattr(cfg, 'V3_STAR_TRAILING_ACTIVATE', 0.08),
-                    'trailing_stop':     getattr(cfg, 'V3_STAR_TRAILING_STOP', 0.05),
-                },
-                'general': {
-                    'top_n':           getattr(cfg, 'V3_TOP_N', 50),
-                    'max_positions':   getattr(cfg, 'V3_MAX_POSITIONS', 3),
-                    'prev_bar_up':     int(getattr(cfg, 'V3_PREV_BAR_UP', False)),
-                    'initial_capital': getattr(cfg, 'V3_INITIAL_CAPITAL', 300000),
-                },
-                '_meta': {'last_modified': '', 'modified_by': ''},
+                'v4': {
+                    'hard_stop':     getattr(_v4, 'HARD_STOP',           0.08),
+                    'new_stock_hs':  getattr(_v4, 'NEW_STOCK_HARD_STOP', 0.08),
+                    'trail_act':     getattr(_v4, 'TRAIL_ACT',           0.28),
+                    'trail_stop':    getattr(_v4, 'TRAIL_STOP',          0.08),
+                    'max_positions': getattr(_v4, 'MAX_POSITIONS',       5),
+                    'ba_min_chg':    getattr(_v4, 'BA_MIN_CHG',          0.0),
+                    'ba_max_chg':    getattr(_v4, 'BA_MAX_CHG',          0.30),
+                    'cool_ret_max':  getattr(_v4, 'COOL_RET_MAX',        0.20),
+                    'vol_ratio_min': getattr(_v4, 'VOL_RATIO_MIN',       0.5),
+                    'vol_ratio_max': getattr(_v4, 'VOL_RATIO_MAX',       5.0),
+                    'gap_min':       getattr(_v4, 'GAP_MIN',             0.005),
+                }
             }
         except Exception as e:
             data = {'error': str(e)}
