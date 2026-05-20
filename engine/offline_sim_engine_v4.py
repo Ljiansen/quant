@@ -56,6 +56,14 @@ class OfflineSimEngineV4(LiveEngineV4):
     def _place_sell_order(self, code: str, qty: int, price: float) -> bool:
         return True
 
+    def _route_buy_price(self, code: str, bar_c: float) -> float:
+        """回测模式：固定走降级路径，禁止调用 get_full_tick 避免实时价污染历史回测。"""
+        return round(bar_c * (1 + SLIPPAGE), 2)
+
+    def _route_sell_price(self, code: str, sell_price: float) -> float:
+        """回测模式：固定走降级路径，禁止调用 get_full_tick 避免实时价污染历史回测。"""
+        return round(sell_price * (1 - SLIPPAGE), 2)
+
     def _subscribe_quotes(self, codes):
         pass
 

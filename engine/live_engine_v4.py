@@ -22,6 +22,7 @@ V4策略实盘引擎 —— OPT-bull (BA选股 + 5min入场 + V3 trail/hs出场 
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -33,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, 'd:/miniqmt_quant')
+import config as _cfg
 
 # xtquant
 try:
@@ -43,6 +45,14 @@ try:
 except Exception:
     _XT_OK = False
     _xtdata = None
+
+# TradeExecutor (V3验证可用的交易封装)
+try:
+    from trade.executor import TradeExecutor as _TradeExecutor
+    _EXECUTOR_OK = True
+except Exception:
+    _EXECUTOR_OK = False
+    _TradeExecutor = None
 
 # 可选：钉钉通知
 try:
@@ -69,19 +79,23 @@ STAR_MAX_CHG        = 0.055      # 科创/创业板最高涨幅
 
 # ─── G3.4 regime-aware 参数包 ─────────────────────────────
 # 对齐: run_g34_verify.py COMMON + per_day_fn + per_stock_fn
+# G3.7 升级 (2026-05-19): init_bnd 动态化 + 宏观熊安全网
 G34_PARAMS = dict(
     # Bull 段 (SH >= MA20)
     bull_mp=5,   bull_hs=0.065, bull_ta=0.40, bull_ts=0.12,
-    # Chop_init 段 (SH < MA20, streak ∈ [1,3])
+    # Chop_init 段 (SH < MA20, streak ∈ [1, cur_init_bnd])
     chop_init_mp=4, chop_init_hs=0.068, chop_init_ta=0.24, chop_init_ts=0.010,
-    # Chop_else 段 (SH < MA20, streak >= 4)
+    # Chop_else 段 (SH < MA20, streak > cur_init_bnd)
     chop_else_mp=3, chop_else_hs=0.085, chop_else_ta=0.22, chop_else_ts=0.08,
-    # Regime 切换边界
-    init_bnd=3,
-    # 安全网 (基于 prev_day SH 30日特征)
+    # G3.7: Regime 切换边界 (动态): close > MA60 → 3, 否则 → 5
+    init_bnd_bull=3,
+    init_bnd_chop=5,
+    # 安全网 (基于 prev_day SH 特征)
     panic_thr=-0.06,            # ret_30d < -0.06 → mp=0 (空仓)
     vol_thr=0.022,              # vol_30d > 0.022 → mp=0 (空仓)
     chop_else_ret5_min=-0.01,   # chop_else段额外: ret_5d < -0.01 → mp=0
+    # G3.7 新增: 宏观熊安全网
+    macro_bear_thr=-0.05,       # ret_60d < -0.05 → mp=0 (空仓)
 )
 
 # Bull 段参数作为模块级别名（供现有代码兼容）
@@ -461,13 +475,14 @@ def build_sh_ma_cache(sh_df: Optional[pd.DataFrame]) -> Dict[str, tuple]:
 
 def _load_sh_features_g34(sh_df: Optional[pd.DataFrame]) -> Dict[str, dict]:
     """
-    从上证指数日线 DataFrame 计算 G3.4 所需每日特征，返回
+    从上证指数日线 DataFrame 计算 G3.7 所需每日特征，返回
     {date_str: {'below': bool, 'streak': int, 'ret_5d': float,
-                'ret_30d': float, 'vol_30d': float}}
+                'ret_30d': float, 'vol_30d': float,
+                'close_gt_ma60': bool, 'ret_60d': float}}
     ⚠️ 反 lookahead: 实盘用 prev_trading_day 的特征
-    对齐: run_g34_verify.py _load_sh_features() (L96-127)
+    对齐: run_g37_verify.py _load_sh_features() (G3.7 新增 close_gt_ma60 + ret_60d)
     """
-    if sh_df is None or len(sh_df) < 31:
+    if sh_df is None or len(sh_df) < 61:
         return {}
 
     close_arr = sh_df['close'].values.astype(float)
@@ -479,7 +494,7 @@ def _load_sh_features_g34(sh_df: Optional[pd.DataFrame]) -> Dict[str, dict]:
     log_ret[1:] = np.log(close_arr[1:] / np.where(close_arr[:-1] > 0, close_arr[:-1], 1))
 
     cache: Dict[str, dict] = {}
-    for i in range(30, n):  # 至少需要30根数据
+    for i in range(60, n):  # 至少需要 60 根数据 (MA60 + ret_60d)
         ma20 = float(np.mean(close_arr[i - 19: i + 1]))
         below = bool(close_arr[i] < ma20)
 
@@ -504,6 +519,11 @@ def _load_sh_features_g34(sh_df: Optional[pd.DataFrame]) -> Dict[str, dict]:
         # vol_30d = std of log_ret[-30:]
         vol_30d = float(np.std(log_ret[i - 29: i + 1])) if i >= 30 else 0.0
 
+        # G3.7 新增: MA60 / close_gt_ma60 / ret_60d
+        ma60 = float(np.mean(close_arr[i - 59: i + 1]))
+        close_gt_ma60 = bool(close_arr[i] > ma60)
+        ret_60d = float(close_arr[i] / close_arr[i - 60] - 1) if close_arr[i - 60] > 0 else 0.0
+
         day_str = pd.Timestamp(dates_arr[i]).strftime('%Y-%m-%d')
         cache[day_str] = {
             'below':  below,
@@ -511,6 +531,8 @@ def _load_sh_features_g34(sh_df: Optional[pd.DataFrame]) -> Dict[str, dict]:
             'ret_5d': ret_5d,
             'ret_30d': ret_30d,
             'vol_30d': vol_30d,
+            'close_gt_ma60': close_gt_ma60,  # G3.7
+            'ret_60d': ret_60d,               # G3.7
         }
     return cache
 
@@ -611,9 +633,8 @@ class LiveEngineV4:
         self._processed_hms: set = set()
         self._last_save_ts: float = 0.0         # P2-2: _save_state 节流时间戳
 
-        # ── xtquant ──
-        self.trader = None
-        self.account = None
+        # ── xtquant 交易封装（复用V3已验证的TradeExecutor）──
+        self.executor = None      # TradeExecutor 实例
         self._subscribed_codes: set = set()  # 已成功订阅 xtdata 5min 的代码集合
 
     # ─────────────────────────────────────────────
@@ -648,13 +669,12 @@ class LiveEngineV4:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] 收到中断信号，退出")
 
         self._save_state()
-        # 关闭 miniQMT 连接，释放线程
-        if self.trader is not None:
+        if self.executor is not None:
             try:
-                self.trader.stop()
+                self.executor.disconnect()
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] miniQMT 连接已关闭")
             except Exception as _e:
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] trader.stop() 异常(忽略): {_e}")
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] executor.disconnect() 异常(忽略): {_e}")
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] ====== V4 引擎已停止 ======")
 
     # ─────────────────────────────────────────────
@@ -854,6 +874,14 @@ class LiveEngineV4:
         all_codes = set(self.buy_candidates) | set(self.positions.keys())
         self._subscribe_quotes(list(all_codes))
 
+        # subscribe_quote 是异步的，需等待本地缓存写入完成才能 get_market_data
+        # 迟启动场景（盘中重启）等 5 秒，正常 9:00 启动最多等 3 秒
+        h_now = datetime.now().hour
+        m_now = datetime.now().minute
+        _wait = 5 if (h_now > 9 or (h_now == 9 and m_now >= 30)) else 3
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 等待行情数据加载 {_wait}s...")
+        time.sleep(_wait)
+
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 盘前处理完成，候选={len(self.buy_candidates)}只，"
               f"订阅={len(all_codes)}只")
 
@@ -1032,6 +1060,7 @@ class LiveEngineV4:
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 过滤链完成: "
               f"raw={len(raw_pool)} daily_ok={len(pool)} hot={_hot_count} "
               f"vol_ratio_ok={len(filtered)}")
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 候选股票: {self.buy_candidates}")
 
     def _apply_gap_filter(self, today_str: str):
         """9:30后执行gap_min过滤（需要today_open）"""
@@ -1074,6 +1103,23 @@ class LiveEngineV4:
         # 获取全部行情bars
         all_codes = set(self.buy_candidates) | set(self.positions.keys())
         self._fetch_5min_bars(list(all_codes), today_str, hm)
+
+        # ── 候选股实时K线状态打印（每根K一行）
+        for _c in self.buy_candidates:
+            _b = self.bars_today.get(_c, {}).get(hm)
+            _pc = self.prev_close_cache.get(_c, 0)
+            if _b:
+                _chg = (_b['close'] - _pc) / _pc if _pc > 0 else 0
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [K] {_c} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} "
+                      f"bars={len(self.bars_today.get(_c,{}))}\u6839 "
+                      f"O={_b['open']:.3f} H={_b['high']:.3f} "
+                      f"L={_b['low']:.3f} C={_b['close']:.3f} "
+                      f"chg={_chg:+.2%} vol={int(_b['volume'])}")
+            else:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [K] {_c} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} "
+                      f"bars={len(self.bars_today.get(_c,{}))}\u6839 [\u65e0bar\u6570\u636e]")
 
         # 持仓监控
         # P0-1: 提前计算一次，避免幽环内重复加建集合
@@ -1165,33 +1211,29 @@ class LiveEngineV4:
 
             _sig_ok = (current_chg > _min_chg(code) and
                        current_chg < _max_chg(code) and
-                       bar['close'] > today_open and
+                       bar['close'] > today_open and        # 收阳线：收盘价>当日9:30开盘价
                        current_chg < _limit_up(code))
             if not _sig_ok:
-                # 每只股票每天只打一次信号失败日志（避免每根K都刷）
-                _dbg_key = f"_sig_logged_{code}_{today_str}"
-                if not getattr(self, _dbg_key, False):
-                    setattr(self, _dbg_key, True)
-                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
-                          f"hm={hm} chg={current_chg:+.2%} "
-                          f"min={_min_chg(code):.2%} max={_max_chg(code):.2%} "
-                          f"close={bar['close']:.3f} open={today_open:.3f} "
-                          f"above_open={bar['close']>today_open} "
-                          f"limit_up={_limit_up(code):.2%}")
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} chg={current_chg:+.2%} "
+                      f"min={_min_chg(code):.2%} max={_max_chg(code):.2%} "
+                      f"close={bar['close']:.3f} open={today_open:.3f} "
+                      f"above_open={bar['close']>today_open} "
+                      f"limit_up={_limit_up(code):.2%}")
                 continue
 
-            # 下单
+            # 下单（V3风格实时价路由：优先卖一价，避免无谓加价）
             buy_px = bar['close']
             qty = _buy_qty(self.cash, len(self.positions), buy_px, self.cur_max_pos)
             if qty <= 0:
                 continue
-            actual_px  = buy_px * (1 + SLIPPAGE)
+            order_px   = self._route_buy_price(code, buy_px)  # 实时路由决定委托价
             commission = _buy_commission(buy_px, qty)
-            total_cost = actual_px * qty + commission
+            total_cost = order_px * qty + commission
             if total_cost > self.cash:
                 continue
 
-            self._execute_buy(code, buy_px, qty, meta, today_str, hm=hm)
+            self._execute_buy(code, buy_px, qty, meta, today_str, hm=hm, order_price=order_px)
 
     def _can_buy_dyn(self, today_str: str, current_hm: Optional[tuple] = None) -> bool:
         """DYN整体浮亏检查（quant.txt 4.2节[3]）
@@ -1392,7 +1434,10 @@ class LiveEngineV4:
     # ─────────────────────────────────────────────
 
     def _g34_regime_decide(self, today_str: str) -> dict:
-        """G3.4 regime 决策，完全对齐 mac run_g34_verify.py per_day_fn.
+        """G3.7 regime 决策，完全对齐 mac run_g37_verify.py per_day_fn.
+        G3.7 升级 (2026-05-19):
+          1. init_bnd 从常数 3 改为动态: close > MA60 → 3, 否则 5
+          2. 新增安全网: ret_60d < -0.05 → 空仓 (宏观熊探测)
         ⚠️ 反 lookahead: 使用 prev_trading_day 的 SH 特征（不是今天）
         返回: {'max_positions': int, 'regime': str}
         """
@@ -1400,7 +1445,6 @@ class LiveEngineV4:
         feat = self.sh_g34_cache.get(prev) if prev else None
         p = G34_PARAMS
         if feat is None:
-            # 缓存缺失（首日/无数据）→ 安全降级到 Bull（与 mac get_prev fallback 一致）
             return {'max_positions': p['bull_mp'], 'regime': 'bull_fallback'}
         # 安全网 1: 30日大跌 → 空仓
         if feat['ret_30d'] < p['panic_thr']:
@@ -1408,19 +1452,25 @@ class LiveEngineV4:
         # 安全网 2: 30日高波 → 空仓
         if feat['vol_30d'] > p['vol_thr']:
             return {'max_positions': 0, 'regime': 'vol_30d'}
+        # G3.7 安全网 3: 宏观熊 (60日跌超 5%) → 空仓
+        if feat['ret_60d'] < p['macro_bear_thr']:
+            return {'max_positions': 0, 'regime': 'macro_bear_60d'}
         # Bull 段 (SH >= MA20)
         if not feat['below']:
             return {'max_positions': p['bull_mp'], 'regime': 'bull'}
-        # Chop_init (streak <= init_bnd)
-        if feat['streak'] <= p['init_bnd']:
+        # G3.7: 动态 init_bnd (close > MA60 → 3, 否则 5)
+        cur_init_bnd = p['init_bnd_bull'] if feat.get('close_gt_ma60', False) else p['init_bnd_chop']
+        # Chop_init (streak <= cur_init_bnd)
+        if feat['streak'] <= cur_init_bnd:
             return {'max_positions': p['chop_init_mp'], 'regime': 'chop_init'}
-        # Chop_else 段安全网 3: 5日跌 → 空仓
+        # Chop_else 段安全网 4: 5日跌 → 空仓
         if feat['ret_5d'] < p['chop_else_ret5_min']:
             return {'max_positions': 0, 'regime': 'chop_else_ret5'}
         return {'max_positions': p['chop_else_mp'], 'regime': 'chop_else'}
 
     def _g34_stock_params(self, today_str: str) -> dict:
-        """G3.4 持仓内参数，完全对齐 mac run_g34_verify.py per_stock_fn.
+        """G3.7 持仓内参数，完全对齐 mac run_g37_verify.py per_stock_fn.
+        G3.7: init_bnd 动态选择 (与 _g34_regime_decide 同步).
         ⚠️ 只在 entry 时刻调用一次，结果写入 position meta，持仓中永远不再重算。
         返回 entry 时刻锁定的 {hs, trail_act, trail_stop}
         """
@@ -1428,12 +1478,11 @@ class LiveEngineV4:
         feat = self.sh_g34_cache.get(prev) if prev else None
         p = G34_PARAMS
         if feat is None or not feat['below']:
-            # Bull 段（或无数据 fallback）
             return dict(hs=p['bull_hs'], trail_act=p['bull_ta'], trail_stop=p['bull_ts'])
-        if feat['streak'] <= p['init_bnd']:
-            # Chop_init 段
+        # G3.7: 动态 init_bnd
+        cur_init_bnd = p['init_bnd_bull'] if feat.get('close_gt_ma60', False) else p['init_bnd_chop']
+        if feat['streak'] <= cur_init_bnd:
             return dict(hs=p['chop_init_hs'], trail_act=p['chop_init_ta'], trail_stop=p['chop_init_ts'])
-        # Chop_else 段
         return dict(hs=p['chop_else_hs'], trail_act=p['chop_else_ta'], trail_stop=p['chop_else_ts'])
 
     # ─────────────────────────────────────────────
@@ -1515,22 +1564,72 @@ class LiveEngineV4:
     # 买入/卖出执行
     # ─────────────────────────────────────────────
 
+    def _route_buy_price(self, code: str, bar_c: float) -> float:
+        """V3风格实时价智能路由：获取卖一价，决定买入委托价（精确到0.01元）。
+        规则（与 V3 live_engine_v3.py L1381-1408 对齐）：
+          卖一价 ≤ bar_c              → 用卖一价（赚到更好价格）
+          卖一价 ≤ bar_c + 0.3%      → 用卖一价（溢价可接受，快速成交）
+          卖一价 > bar_c + 0.3%      → 挂 bar_c 等价格回落（被动等待）
+          get_full_tick 失败/无数据   → 降级 bar_c + SLIPPAGE(0.015%)
+        """
+        if not (_XT_OK and _xtdata is not None):
+            return round(bar_c * (1 + SLIPPAGE), 2)
+        slip_max = getattr(_cfg, 'V3_LIVE_BUY_SLIP_MAX', 0.003)
+        try:
+            symbol = _format_symbol(code)
+            ticks  = _xtdata.get_full_tick([symbol])
+            if ticks and symbol in ticks:
+                tick     = ticks[symbol]
+                ask_list = tick.get('askPrice', [])
+                ask      = float(ask_list[0]) if ask_list else 0.0
+                if ask <= 0:
+                    ask = float(tick.get('lastPrice', 0) or 0)
+                if ask > 0:
+                    slip = (ask - bar_c) / bar_c if ask > bar_c else 0.0
+                    if ask <= bar_c:
+                        order_px = round(ask, 2)
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                              f"卖一价{ask:.3f}≤close{bar_c:.3f}，以卖一价买入（获更优价格）")
+                        return order_px
+                    elif slip <= slip_max:
+                        order_px = round(ask, 2)
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                              f"卖一价{ask:.3f} 溢价{slip:.2%}≤{slip_max:.2%}，接受实时卖一价")
+                        return order_px
+                    else:
+                        order_px = round(bar_c, 2)
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                              f"卖一价{ask:.3f} 溢价{slip:.2%}>{slip_max:.2%}，"
+                              f"挂close价{bar_c:.3f}等待回落")
+                        return order_px
+        except Exception as _e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] get_full_tick异常({_e})，"
+                  f"降级用close+{SLIPPAGE:.4%}")
+        return round(bar_c * (1 + SLIPPAGE), 2)
+
     def _execute_buy(self, code: str, buy_px: float, qty: int,
-                     meta: dict, today_str: str, hm: tuple = None):
-        """执行买入"""
-        actual_px  = buy_px * (1 + SLIPPAGE)
+                     meta: dict, today_str: str, hm: tuple = None,
+                     order_price: float = None):
+        """执行买入
+        order_price: 由 _route_buy_price() 决定的实际委托价；
+                     None 时降级为 buy_px * (1+SLIPPAGE)（兼容回测模式）。
+        """
+        actual_px  = order_price if order_price is not None else round(buy_px * (1 + SLIPPAGE), 2)
         commission = _buy_commission(buy_px, qty)
         total_cost = actual_px * qty + commission
 
-        ok = self._place_buy_order(code, qty, actual_px)  # P1-1: 委托价用含滑点的 actual_px
+        ok = self._place_buy_order(code, qty, actual_px)  # P1-1: 委托价用路由/滑点价
         if not ok:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ⚠️ 买入委托失败(order_id=-1): {code} "
+                  f"price={actual_px:.3f} qty={qty} "
+                  f"— 检查 QMT 是否已登录并处于实盘模式")
             return
 
         # G3.4 入场瞬间锁定参数（per_stock_fn，持仓中永远不再重算）
         _sp = self._g34_stock_params(today_str)
         self.cash -= total_cost
         self.positions[code] = {
-            'code': code, 'buy_price': actual_px, 'buy_date': today_str,
+            'code': code, 'buy_price': round(actual_px, 2), 'buy_date': today_str,
             'quantity': qty, 'days_held': 0,
             'highest_price': actual_px,
             'trend_type': meta.get('type', 'RISING'),
@@ -1562,6 +1661,49 @@ class LiveEngineV4:
                 pass
         self._save_state(force=True)  # P2-2: 买入为关键事件，强制写盘
 
+    def _route_sell_price(self, code: str, sell_price: float) -> float:
+        """V3风格实时价路由：获取买一价，决定卖出委托价（精确到0.01元）。
+        规则（与 V3 live_engine_v3.py L1934-1958 对齐）：
+          买一价 ≥ 止损价              → 用买一价（获更优价格）
+          折价 ≤ 0.3%                 → 用买一价（可接受，快速成交）
+          折价 > 0.3%                 → 仍用买一价（止损优先成交，打WARN）
+          get_full_tick 失败/无数据   → 降级 sell_price - SLIPPAGE(0.015%)
+        """
+        if not (_XT_OK and _xtdata is not None):
+            return round(sell_price * (1 - SLIPPAGE), 2)
+        slip_max = getattr(_cfg, 'V3_LIVE_SELL_SLIP_MAX', 0.003)
+        try:
+            symbol = _format_symbol(code)
+            ticks  = _xtdata.get_full_tick([symbol])
+            if ticks and symbol in ticks:
+                tick     = ticks[symbol]
+                bid_list = tick.get('bidPrice', [])
+                bid      = float(bid_list[0]) if bid_list else 0.0
+                if bid <= 0:
+                    bid = float(tick.get('lastPrice', 0) or 0)
+                if bid > 0:
+                    slip = (sell_price - bid) / sell_price if bid < sell_price else 0.0
+                    if bid >= sell_price:
+                        order_px = round(bid, 2)
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                              f"买一价{bid:.3f}≥止损价{sell_price:.3f}，获更优卖出价")
+                        return order_px
+                    elif slip <= slip_max:
+                        order_px = round(bid, 2)
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] {code} "
+                              f"买一价{bid:.3f} 折价{slip:.2%}≤{slip_max:.2%}，接受实时买一价")
+                        return order_px
+                    else:
+                        order_px = round(bid, 2)  # 折价>阈值，仍用买一价（止损优先）
+                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由][WARN] {code} "
+                              f"买一价{bid:.3f} 折价{slip:.2%}>{slip_max:.2%}，"
+                              f"超阈值但止损优先，强制用买一价")
+                        return order_px
+        except Exception as _e:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [路由] get_full_tick异常({_e})，"
+                  f"降级用sell_price-{SLIPPAGE:.4%}")
+        return round(sell_price * (1 - SLIPPAGE), 2)
+
     def _execute_sell(self, code: str, pos: dict, sell_price: float,
                       reason: str, today_str: str, hm: tuple = None):
         """执行卖出"""
@@ -1572,25 +1714,27 @@ class LiveEngineV4:
         net, commission, stamp_tax = _sell_net(sell_price, qty)
         pnl = net - pos['buy_price'] * qty
 
-        # P1-2: 委托价用含负滑点的限价（让真实成交价 ≤ 策略分析价）
-        actual_sell = round(sell_price * (1 - SLIPPAGE), 3)
+        # V3风格实时价路由：止损用买一价，确保快速成交；降级用 sell_price - SLIPPAGE
+        actual_sell = self._route_sell_price(code, sell_price)
         ok = self._place_sell_order(code, qty, actual_sell)
         if not ok:
             return
 
         self.cash += net
+        slip_amt = round(sell_price - actual_sell, 4)
         self._log_trade('sell', code, sell_price, qty, reason,
                         fee=commission + stamp_tax, pnl=pnl,
                         cash_after=self.cash,
                         days_held=pos.get('days_held', 0),
                         signal_px=round(sell_price, 4),
                         order_px=round(actual_sell, 4),
-                        slippage_amt=round(sell_price - actual_sell, 6),
-                        slippage_pct=SLIPPAGE,
+                        slippage_amt=slip_amt,
+                        slippage_pct=round(slip_amt / sell_price, 6) if sell_price else 0,
                         trigger_hm=f"{hm[0]:02d}:{hm[1]:02d}" if hm else None,
                         buy_price_ref=round(pos.get('buy_price', 0), 4),
                         buy_date_ref=pos.get('buy_date', ''),
-                        snapshot_regime=pos.get('snapshot_regime', ''))
+                        snapshot_regime=pos.get('snapshot_regime', ''),
+                        bars_5min=pos.get('history', {}).get('bars_5min', []))
         del self.positions[code]
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 卖出: {code} "
@@ -1609,80 +1753,19 @@ class LiveEngineV4:
     # ─────────────────────────────────────────────
 
     def _connect_xt(self) -> bool:
+        """验证 xtquant / TradeExecutor 可用性。
+        V4 不维持持久 executor——每次下单由独立子进程（_place_order_worker.py）
+        创建连接，避免 xtdata 与 XtQuantTrader 在同进程共存时 session_id 冲突。
+        """
         if not _XT_OK:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] xtquant未安装，模拟模式运行")
             self.cash = self.initial_capital
             return True
-        try:
-            import config as _cfg
-            session_id   = getattr(_cfg, 'SESSION_ID',   654321)
-            account_type = getattr(_cfg, 'ACCOUNT_TYPE', 'STOCK')
-        except Exception:
-            session_id, account_type = 654321, 'STOCK'
-
-        # 启动前自动清理残留锁文件（上次进程崩溃未 stop 时会残留 lock 文件）
-        lock_file = os.path.join(self.xt_path, f'lock_down_queue_win_{session_id}')
-        if os.path.exists(lock_file):
-            try:
-                os.remove(lock_file)
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 已清理残留锁文件 session={session_id}")
-            except OSError:
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] 警告: session={session_id} 锁文件被占用！"
-                      f"可能有僵尸进程持有该 session，请手动终止占用进程后重启")
-
-        # xtquant 正确顺序: create → register_callback → start → connect
-        # （与 V3 TradeExecutor.connect() 对齐，connect 在 start 之前返回 -1）
-        for attempt in range(1, 4):  # 最多重试3次
-            # 每次重试前先 stop 上一次的 trader，避免线程泄漏
-            if self.trader is not None:
-                try:
-                    self.trader.stop()
-                except Exception:
-                    pass
-                self.trader = None
-            try:
-                self.trader = XtQuantTrader(self.xt_path, session_id)
-
-                # 注册回调（成交通知、断线通知）
-                try:
-                    from xtquant.xttrader import XtQuantTraderCallback
-                    class _V4Callback(XtQuantTraderCallback):
-                        def on_disconnected(self):
-                            print(f"[{_now_str()}] [V4回调] miniQMT连接断开")
-                        def on_stock_trade(self, trade):
-                            print(f"[{_now_str()}] [V4回调] 成交: {trade.stock_code} "
-                                  f"方向={'买' if trade.order_type==23 else '卖'} "
-                                  f"量={trade.traded_volume} 价={trade.traded_price}")
-                    self.trader.register_callback(_V4Callback())
-                except Exception:
-                    pass  # 不阻断，回调注册失败不影响下单
-
-                self.trader.start()          # ① 先 start，启动内部线程
-                time.sleep(1.0)              # 等待线程初始化稳定
-
-                self.account = StockAccount(self.account_id, account_type)
-                conn = self.trader.connect() # ② 再 connect
-                if conn == 0:
-                    sub = self.trader.subscribe(self.account)
-                    if sub != 0:
-                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] "
-                              f"警告: subscribe 返回 {sub}（非0），账户订阅可能未生效）")
-                    else:
-                        print(f"[{_now_str()}] [{self.ENGINE_NAME}] miniQMT连接成功 "
-                              f"session={session_id} subscribe=OK")
-                    return True
-                else:
-                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] "
-                          f"miniQMT连接失败 返回码={conn}，第{attempt}/3次 "
-                          f"（2秒后重试）")
-                    time.sleep(2)
-            except Exception as e:
-                print(f"[{_now_str()}] [{self.ENGINE_NAME}] "
-                      f"miniQMT连接异常(第{attempt}/3次): {e}")
-                time.sleep(2)
-
-        print(f"[{_now_str()}] [{self.ENGINE_NAME}] miniQMT连接失败，已重试3次，退出")
-        return False
+        if not _EXECUTOR_OK or _TradeExecutor is None:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] TradeExecutor 导入失败，无法连接")
+            return False
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] xtquant 验证通过，下单将通过子进程隔离执行")
+        return True
 
     def _subscribe_quotes(self, codes: List[str]):
         """xtdata 5min 订阅。xtquant subscribe_quote 只接受单个 stock_code 字符串，必须逐支订阅。"""
@@ -1716,6 +1799,67 @@ class LiveEngineV4:
                 except Exception:
                     pass
             try:
+                # xtdata get_market_data 返回格式有两种：
+                #   dict格式: data['close'][symbol] = {t_key: value, ...}  (旧版/离线)
+                #   DataFrame格式: data['close'] = DataFrame, data['close'][symbol] = Series  (实盘)
+
+                def _get_field_series(d, field, sym):
+                    """从 get_market_data 返回值中安全提取某字段的时间序列
+                    xtdata 实盘返回格式:
+                      DataFrame转置格式: index=股票代码  columns=时间戳字符串(YYYYMMDDHHMMSS)
+                      进行取行: data['close'].loc[symbol] → Series indexed by timestamp str
+                    离线/旧版格式:
+                      dict格式: data['close'][symbol] = {t_key: value, ...}
+                    """
+                    if not d:
+                        return None
+                    raw = d.get(field)
+                    if raw is None:
+                        return None
+                    # DataFrame 格式（xtdata 实盘）
+                    try:
+                        import pandas as _pd
+                        if isinstance(raw, _pd.DataFrame):
+                            # 转置格式: index=股票代码, columns=时间戳
+                            if sym in raw.index:
+                                return raw.loc[sym]  # 返回 Series, index=时间戳字符串
+                            # 兼容旧格式: columns=股票代码
+                            if sym in raw.columns:
+                                return raw[sym]
+                            return None
+                    except ImportError:
+                        pass
+                    # dict 格式（离线回测）
+                    if isinstance(raw, dict):
+                        return raw.get(sym)
+                    return None
+
+                def _series_empty(s):
+                    if s is None:
+                        return True
+                    try:
+                        import pandas as _pd
+                        if isinstance(s, _pd.Series):
+                            return s.empty
+                    except ImportError:
+                        pass
+                    return len(s) == 0
+
+                def _series_times(s):
+                    """获取时间序列的 key 列表，兼容 dict 和 pandas Series"""
+                    if s is None:
+                        return []
+                    try:
+                        import pandas as _pd
+                        if isinstance(s, _pd.Series):
+                            return list(s.index)
+                    except ImportError:
+                        pass
+                    if isinstance(s, dict):
+                        return list(s.keys())
+                    return []
+
+                # ① 优先用日期范围拉取
                 data = _xtdata.get_market_data(
                     field_list=['open', 'high', 'low', 'close', 'volume'],
                     stock_list=[symbol],
@@ -1724,27 +1868,57 @@ class LiveEngineV4:
                     end_time=today_str.replace('-', ''),
                     count=-1,
                 )
-                if not data or symbol not in data.get('close', {}):
+                closes = _get_field_series(data, 'close', symbol)
+                # ② 若日期范围返回空，降级用 count=200 拉最近K线
+                if _series_empty(closes):
+                    data = _xtdata.get_market_data(
+                        field_list=['open', 'high', 'low', 'close', 'volume'],
+                        stock_list=[symbol],
+                        period='5m',
+                        count=200,
+                    )
+                    closes = _get_field_series(data, 'close', symbol)
+                # ③ 仍为空则等 2s 重试一次
+                if _series_empty(closes):
+                    time.sleep(2)
+                    data = _xtdata.get_market_data(
+                        field_list=['open', 'high', 'low', 'close', 'volume'],
+                        stock_list=[symbol],
+                        period='5m',
+                        count=200,
+                    )
+                    closes = _get_field_series(data, 'close', symbol)
+                if _series_empty(closes):
                     continue
-                closes = data['close'][symbol]
-                opens  = data['open'][symbol]
-                highs  = data['high'][symbol]
-                lows   = data['low'][symbol]
-                vols   = data['volume'][symbol]
-                times  = list(closes.keys()) if isinstance(closes, dict) else []
+                opens = _get_field_series(data, 'open',   symbol)
+                highs = _get_field_series(data, 'high',   symbol)
+                lows  = _get_field_series(data, 'low',    symbol)
+                vols  = _get_field_series(data, 'volume', symbol)
+                times = _series_times(closes)
 
                 if not self.bars_today.get(code):
                     self.bars_today[code] = {}
 
                 for t_key in times:
-                    # t_key格式: 'YYYYMMDDHHMMSS' 或 datetime
+                    # t_key格式: 'YYYYMMDDHHMMSS' 字符串 或 pandas Timestamp/datetime
                     try:
                         if isinstance(t_key, str) and len(t_key) >= 12:
+                            bar_date = t_key[:8]  # 'YYYYMMDD'
                             bh = int(t_key[8:10])
                             bm = int(t_key[10:12])
                         elif hasattr(t_key, 'hour'):
+                            bar_date = t_key.strftime('%Y%m%d') if hasattr(t_key, 'strftime') else ''
                             bh, bm = t_key.hour, t_key.minute
+                        elif isinstance(t_key, (int, float)):
+                            # 整数时间戳（毫秒级）
+                            import datetime as _dt
+                            ts = _dt.datetime.fromtimestamp(t_key / 1000)
+                            bar_date = ts.strftime('%Y%m%d')
+                            bh, bm = ts.hour, ts.minute
                         else:
+                            continue
+                        # 过滤非今日K线（count=200降级时会拉到昨日数据）
+                        if bar_date and bar_date != today_str.replace('-', ''):
                             continue
                         bar_hm = (bh, bm)
                         if bar_hm not in self.bars_today[code]:
@@ -1755,7 +1929,7 @@ class LiveEngineV4:
                                 'close':  float(closes[t_key]),
                                 'volume': float(vols[t_key]),
                             }
-                        # 更新day_open_cache（用9:30 open）
+                        # 更新day_open_cache（9:30 open）
                         if bar_hm == (9, 30) and code not in self.day_open_cache:
                             self.day_open_cache[code] = float(opens[t_key])
                     except Exception:
@@ -1789,44 +1963,104 @@ class LiveEngineV4:
                 pass
         return 0.0
 
+    def _make_fresh_executor(self) -> object:
+        """下单前创建全新 TradeExecutor 实例（与测试脚本行为一致，避免持久连接冲突）"""
+        ex = _TradeExecutor(
+            mini_qmt_path=self.xt_path,
+            account_id=self.account_id,
+        )
+        ok = ex.connect()
+        if not ok:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 临时 TradeExecutor 连接失败")
+            return None
+        time.sleep(1)  # 等待 XtQuantTrader 注册到 QMT 服务器
+        return ex
+
+    def _run_order_worker(self, action: str, code: str, qty: int, price: float) -> dict:
+        """通过独立子进程下单，避免 xtdata 与 XtQuantTrader 在同进程共存时的干扰。
+        子进程（_place_order_worker.py）在无 xtdata 的干净环境中连接 TradeExecutor。
+        返回 dict: {ok, oid, n_orders, found_ids, error}
+        """
+        worker_script = os.path.join(os.path.dirname(__file__), '_place_order_worker.py')
+        params = json.dumps({
+            'xt_path':    self.xt_path,
+            'account_id': self.account_id,
+            'session_id': 654321,
+            'action':     action,
+            'symbol':     _format_symbol(code),
+            'price':      float(price),
+            'volume':     int(qty),
+            'remark':     f'V4_{action}_{code}',
+        }, ensure_ascii=False)
+        try:
+            result = subprocess.run(
+                [sys.executable, worker_script, params],
+                capture_output=True, text=True, timeout=20,
+            )
+            # 打印子进程完整日志（便于诊断）
+            if result.stdout:
+                for ln in result.stdout.strip().splitlines():
+                    if ln.strip():
+                        print(f"  [worker] {ln.strip()}")
+            if result.stderr:
+                for ln in result.stderr.strip().splitlines():
+                    if ln.strip():
+                        print(f"  [worker-err] {ln.strip()}")
+            # 取最后一行 JSON（忽略 TradeExecutor 打印的其他日志）
+            lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+            for line in reversed(lines):
+                try:
+                    return json.loads(line)
+                except Exception:
+                    continue
+            stderr_info = result.stderr.strip()[:200] if result.stderr else ''
+            return {'ok': False, 'oid': -1, 'error': f'no json output; stderr={stderr_info}'}
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'oid': -1, 'error': 'subprocess timeout'}
+        except Exception as e:
+            return {'ok': False, 'oid': -1, 'error': str(e)}
+
     def _place_buy_order(self, code: str, qty: int, price: float) -> bool:
-        if not _XT_OK or self.trader is None:
-            if self.account_id:  # P0-2: 实盘模式下 xtquant 不可用，严正拒绝
+        if not _XT_OK or not _EXECUTOR_OK:
+            if self.account_id:
                 raise RuntimeError(
                     f"xtquant 不可用，实盘拒绝买入委托 {code}（避免假装下单）")
-            return True  # 回测模式（account_id为空）直接成功
-        from xtquant.xtconstant import STOCK_BUY
-        try:
-            oid = self.trader.order_stock(
-                self.account, _format_symbol(code), STOCK_BUY, qty,
-                2,  # 限价
-                price, 'V4_buy', f'V4_buy_{code}'
-            )
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入委托: {code} "
-                  f"price={price:.3f} qty={qty} order_id={oid}")
-            return oid != -1
-        except Exception as e:
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 买入委托异常 {code}: {e}")
-            return False
+            return True  # 回测模式
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程买入: {code} "
+              f"price={price:.3f} qty={qty} → 启动独立下单进程...")
+        r = self._run_order_worker('buy', code, qty, price)
+        oid = r.get('oid', -1)
+        ok  = r.get('ok', False)
+        err = r.get('error', '')
+        n   = r.get('n_orders', '?')
+        fids = r.get('found_ids', [])
+        if ok:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 买入委托确认: "
+                  f"{code} order_id={oid} 已进入QMT委托列表（共{n}笔）")
+        else:
+            detail = err if err else f"order_id={oid} 不在QMT列表({fids})"
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 买入委托失败: {code} — {detail}")
+        return ok
 
     def _place_sell_order(self, code: str, qty: int, price: float) -> bool:
-        if not _XT_OK or self.trader is None:
-            if self.account_id:  # P0-2: 实盘模式下 xtquant 不可用，严正拒绝
+        if not _XT_OK or not _EXECUTOR_OK:
+            if self.account_id:
                 raise RuntimeError(
                     f"xtquant 不可用，实盘拒绝卖出委托 {code}（避免假装下单）")
-            return True  # 回测模式（account_id为空）直接成功
-        from xtquant.xtconstant import STOCK_SELL
-        try:
-            oid = self.trader.order_stock(
-                self.account, _format_symbol(code), STOCK_SELL, qty,
-                2, price, 'V4_sell', f'V4_sell_{code}'
-            )
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 卖出委托: {code} "
-                  f"price={price:.3f} qty={qty} order_id={oid}")
-            return oid != -1
-        except Exception as e:
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 卖出委托异常 {code}: {e}")
-            return False
+            return True  # 回测模式
+        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程卖出: {code} "
+              f"price={price:.3f} qty={qty} → 启动独立下单进程...")
+        r = self._run_order_worker('sell', code, qty, price)
+        oid = r.get('oid', -1)
+        ok  = r.get('ok', False)
+        err = r.get('error', '')
+        if ok:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 卖出委托确认: "
+                  f"{code} order_id={oid} 已进入QMT委托列表")
+        else:
+            detail = err if err else f"order_id={oid}"
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 卖出委托失败: {code} — {detail}")
+        return ok
 
     # ─────────────────────────────────────────────
     # 状态持久化

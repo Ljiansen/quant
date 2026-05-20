@@ -203,7 +203,7 @@ class TradeExecutor:
                 order_type=_ORDER_TYPE_MAP["buy"],
                 order_volume=int(volume),
                 price_type=pt,
-                price=float(price),
+                price=round(float(price), 2),  # A股最小 tick=0.01，必须 round 否则 miniQMT 静默拒绝
                 strategy_name="TradeExecutor",
                 order_remark=order_remark,
             )
@@ -247,7 +247,7 @@ class TradeExecutor:
                 order_type=_ORDER_TYPE_MAP["sell"],
                 order_volume=int(volume),
                 price_type=pt,
-                price=float(price),
+                price=round(float(price), 2),  # A股最小 tick=0.01，必须 round 否则 miniQMT 静默拒绝
                 strategy_name="TradeExecutor",
                 order_remark=order_remark,
             )
