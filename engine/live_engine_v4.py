@@ -612,6 +612,7 @@ class LiveEngineV4:
         # ── 选股相关 ──
         self.today_pool: List[Tuple[str, int, int]] = []    # [(code,rank,score)]
         self.buy_candidates: List[str] = []
+        self._premarket_filtered: Dict[str, str] = {}  # code → 盘前过滤原因（供 dashboard 展示）
         self.stock_meta: Dict[str, dict] = {}
         self.all_trading_dates: List[str] = []
         self.sh_ma_cache: Dict[str, tuple] = {}
@@ -942,21 +943,30 @@ class LiveEngineV4:
         # ① daily_filter + ② 趋势分类
         pool = []
         self.stock_meta = {}
+        self._premarket_filtered = {}   # 每日重置；code → 盘前过滤原因
         _cnt_no_data = 0; _cnt_low_hist = 0; _cnt_low_amount = 0; _cnt_falling = 0
         for code in raw_pool:
             df = self.daily_data.get(code)
             if df is None:
-                _cnt_no_data += 1; continue
+                _cnt_no_data += 1
+                self._premarket_filtered[code] = '无日线数据'
+                continue
             hist = df[df['date'] < today_dt]
             if len(hist) < DAILY_AMOUNT_DAYS:
-                _cnt_low_hist += 1; continue
+                _cnt_low_hist += 1
+                self._premarket_filtered[code] = '历史数据不足'
+                continue
             avg_amount = float(hist['amount'].iloc[-DAILY_AMOUNT_DAYS:].mean())
             if avg_amount < DAILY_MIN_AMOUNT:
-                _cnt_low_amount += 1; continue
+                _cnt_low_amount += 1
+                self._premarket_filtered[code] = '流动性不足'
+                continue
             # ② 趋势分类（用昨日及之前）
             stype, ma20, slope, cp, low20, vol = classify_trend(hist)
             if stype == 'FALLING':
-                _cnt_falling += 1; continue
+                _cnt_falling += 1
+                self._premarket_filtered[code] = '下跌趋势'
+                continue
             # is_new_stock判断
             n_rows = int((df['date'] <= today_dt).sum())
             is_new = NEW_STOCK_MIN_DAYS <= n_rows < NEW_STOCK_MAX_DAYS
@@ -1010,6 +1020,11 @@ class LiveEngineV4:
             if c not in seen:
                 seen.add(c)
                 buy_candidates.append(c)
+        # 记录过热股票到 _premarket_filtered
+        for code in pool:
+            if self.stock_meta[code]['ret_20d'] > COOL_RET_MAX and code not in cooled_list:
+                r = self.stock_meta[code]['ret_20d']
+                self._premarket_filtered[code] = f'过热({r*100:.0f}%/20d)'
 
         # ⑤ vol_ratio过滤（用昨日volume）
         filtered = []
@@ -1030,6 +1045,7 @@ class LiveEngineV4:
                 filtered.append(code)
             else:
                 _vr_removed.append(f"{code}({vr:.2f})")
+                self._premarket_filtered[code] = f'量比异常({vr:.2f}x)'
 
         self.buy_candidates = filtered
         if _vr_removed:
@@ -1051,10 +1067,14 @@ class LiveEngineV4:
         if sh_info_wm is not None:
             _ma20_wm, _slope_wm, _sh_below_wm = sh_info_wm
             if _sh_below_wm:  # 昨日上证 < MA20 = 弱市
+                _prev_bc = self.buy_candidates
                 self.buy_candidates = [
-                    c for c in self.buy_candidates
+                    c for c in _prev_bc
                     if self.stock_meta.get(c, {}).get('ret_20d', 0.0) >= WEAK_MKT_MOMENTUM_THRESHOLD
                 ]
+                for _c in set(_prev_bc) - set(self.buy_candidates):
+                    _r = self.stock_meta.get(_c, {}).get('ret_20d', 0.0)
+                    self._premarket_filtered[_c] = f'弱市低动量({_r*100:.0f}%/20d)'
 
         _hot_count = len([c for c in pool if self.stock_meta.get(c, {}).get('ret_20d', 0) > COOL_RET_MAX])
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 过滤链完成: "
@@ -1078,6 +1098,7 @@ class LiveEngineV4:
                 filtered.append(code)
             else:
                 removed_detail.append(f"{code}(gap={gap:+.2%})")
+                self._premarket_filtered[code] = f'今开差不足({gap:+.2%})'
         removed = len(self.buy_candidates) - len(filtered)
         self.buy_candidates = filtered
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] gap_min({GAP_MIN:.1%})过滤: "
@@ -1129,6 +1150,8 @@ class LiveEngineV4:
         for code, pos in list(self.positions.items()):
             bar = self.bars_today.get(code, {}).get(hm)
             if bar is None:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [K-POS] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} 无bar数据，跳过持仓监控")
                 continue
 
             # 更新highest_price（用bar['high']，每根K必须更新）
@@ -1141,6 +1164,28 @@ class LiveEngineV4:
                 'o': bar['open'], 'h': bar['high'],
                 'l': bar['low'],  'c': bar['close'], 'v': bar['volume'],
             })
+
+            # ── [K-POS] 持仓状态与止损水位实时打印 ──
+            _bp   = pos['buy_price']
+            _hp   = pos.get('highest_price', _bp)
+            _hs   = _hard_sl(code, pos)
+            _hs_px = _bp * (1 - _hs) if _hs > 0 else 0
+            _ta   = _trail_act(code, pos)
+            _ts   = _trail_stop_pct(code, pos)
+            _trail_active = _hp >= _bp * (1 + _ta)
+            _trail_px = _hp * (1 - _ts) if _trail_active else None
+            _pc_pos = self.prev_close_cache.get(code, _bp)
+            _chg_pos = (bar['close'] - _pc_pos) / _pc_pos if _pc_pos > 0 else 0
+            _days = pos.get('days_held', 0)
+            if _trail_active and _trail_px is not None:
+                _lim_trig = _trail_px * (1 - STOP_LIMIT_SLIP)
+                _t_str = f"trail={_trail_px:.3f}({'★触发!' if bar['low'] <= _lim_trig else '·'})"
+            else:
+                _t_str = f"trail=未激活(需涨{_ta:.1%}激活)"
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [K-POS] {code} "
+                  f"hm={hm[0]:02d}:{hm[1]:02d} C={bar['close']:.3f} chg={_chg_pos:+.2%} "
+                  f"hp={_hp:.3f} hs={_hs_px:.3f}(-{_hs:.1%}) {_t_str}"
+                  + (f" days={_days}" if _days > 0 else " [T+0买入日]"))
 
             # T+1限制：买入当天days_held=0，只更新不卖出
             if pos.get('days_held', 0) == 0:
@@ -1163,33 +1208,53 @@ class LiveEngineV4:
             return
 
         # DYN整体浮亏检查
-        if not self._can_buy_dyn(today_str, current_hm=hm):
+        _dyn_ok = self._can_buy_dyn(today_str, current_hm=hm)
+        if not _dyn_ok:
+            # 计算实际浮亏供诊断
+            _tot_cost = sum(p['buy_price'] * p['quantity'] for p in self.positions.values())
+            _tot_mkt  = sum(
+                (self.bars_today.get(c, {}).get(hm, {}) or {}).get('close', p['buy_price']) * p['quantity']
+                for c, p in self.positions.items()
+            )
+            _pnl_pct = (_tot_mkt - _tot_cost) / _tot_cost if _tot_cost > 0 else 0
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-DYN] hm={hm[0]:02d}:{hm[1]:02d} "
+                  f"DYN浮亏拦截 pnl={_pnl_pct:+.2%} "
+                  f"(cost={_tot_cost:.0f} mkt={_tot_mkt:.0f}) → 跳过买入扫描")
             return
 
         if len(self.positions) >= self.cur_max_pos:
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] hm={hm[0]:02d}:{hm[1]:02d} "
+                  f"满仓 {len(self.positions)}/{self.cur_max_pos} → 跳过买入扫描")
             return
 
         for code in self.buy_candidates:
             if len(self.positions) >= self.cur_max_pos:
                 break
-            if code in self.positions or code in self._bought_today:
+            if code in self.positions:
+                continue
+            if code in self._bought_today:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} 今日已买入/尝试过 → 跳过")
                 continue
 
             meta = self.stock_meta.get(code)
             if not meta:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} stock_meta缺失 → 跳过")
                 continue
 
             # 新股仓位上限
             if meta.get('is_new'):
                 cur_new = sum(1 for p in self.positions.values() if p.get('is_new_stock'))
                 if cur_new >= MAX_NEW_STOCK_POSITIONS:
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                          f"hm={hm[0]:02d}:{hm[1]:02d} 新股仓位上限 {cur_new}/{MAX_NEW_STOCK_POSITIONS} → 跳过")
                     continue
 
             bar = self.bars_today.get(code, {}).get(hm)
             if bar is None or bar['volume'] <= 0:
-                if hm == (9, 35):  # 仅第一根K线时打印，避免每根都刷屏
-                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
-                          f"hm={hm} 无bar数据(bars_today有{len(self.bars_today.get(code, {}))}根)")
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} 无bar/零量(共{len(self.bars_today.get(code, {}))}根) → 跳过")
                 continue
 
             # 9:30防御（实际hm<(9,35)已return，这里是冗余保护）
@@ -1199,10 +1264,15 @@ class LiveEngineV4:
 
             # 信号判定（RISING分支，quant.txt 4.2节[9]）
             if meta['type'] != 'RISING':
+                if hm == (9, 35):  # 仅首根打印，避免全天刷屏
+                    print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                          f"hm=09:35 type={meta.get('type','?')} 非RISING → 全天跳过")
                 continue
 
             prev_c = self.prev_close_cache.get(code, 0)
             if prev_c <= 0:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} prev_close缺失 → 跳过")
                 continue
             current_chg = (bar['close'] - prev_c) / prev_c
             today_open = self.day_open_cache.get(code, 0)
@@ -1226,11 +1296,16 @@ class LiveEngineV4:
             buy_px = bar['close']
             qty = _buy_qty(self.cash, len(self.positions), buy_px, self.cur_max_pos)
             if qty <= 0:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} qty=0(cash={self.cash:.0f} px={buy_px:.3f} "
+                      f"pos={len(self.positions)}/{self.cur_max_pos}) → 跳过")
                 continue
             order_px   = self._route_buy_price(code, buy_px)  # 实时路由决定委托价
             commission = _buy_commission(buy_px, qty)
             total_cost = order_px * qty + commission
             if total_cost > self.cash:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] [DBG-BUY] {code} "
+                      f"hm={hm[0]:02d}:{hm[1]:02d} 资金不足 cost={total_cost:.0f} > cash={self.cash:.0f} → 跳过")
                 continue
 
             self._execute_buy(code, buy_px, qty, meta, today_str, hm=hm, order_price=order_px)
@@ -1629,7 +1704,7 @@ class LiveEngineV4:
         _sp = self._g34_stock_params(today_str)
         self.cash -= total_cost
         self.positions[code] = {
-            'code': code, 'buy_price': round(actual_px, 2), 'buy_date': today_str,
+            'code': code, 'buy_price': round(actual_px, 3), 'buy_date': today_str,
             'quantity': qty, 'days_held': 0,
             'highest_price': actual_px,
             'trend_type': meta.get('type', 'RISING'),
@@ -2026,21 +2101,33 @@ class LiveEngineV4:
                 raise RuntimeError(
                     f"xtquant 不可用，实盘拒绝买入委托 {code}（避免假装下单）")
             return True  # 回测模式
-        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程买入: {code} "
-              f"price={price:.3f} qty={qty} → 启动独立下单进程...")
-        r = self._run_order_worker('buy', code, qty, price)
-        oid = r.get('oid', -1)
-        ok  = r.get('ok', False)
-        err = r.get('error', '')
-        n   = r.get('n_orders', '?')
-        fids = r.get('found_ids', [])
-        if ok:
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 买入委托确认: "
-                  f"{code} order_id={oid} 已进入QMT委托列表（共{n}笔）")
-        else:
+        import time as _time
+        _MAX_ATTEMPTS = 2    # connect failed 最多重试 1 次
+        _RETRY_WAIT   = 2.0  # session_id 释放等待时间(s)
+        for _attempt in range(1, _MAX_ATTEMPTS + 1):
+            _retry_tag = f"（第{_attempt}次尝试）" if _attempt > 1 else ""
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程买入: {code} "
+                  f"price={price:.3f} qty={qty} → 启动独立下单进程...{_retry_tag}")
+            r = self._run_order_worker('buy', code, qty, price)
+            oid  = r.get('oid', -1)
+            ok   = r.get('ok', False)
+            err  = r.get('error', '')
+            n    = r.get('n_orders', '?')
+            fids = r.get('found_ids', [])
+            if ok:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 买入委托确认: "
+                      f"{code} order_id={oid} 已进入QMT委托列表（共{n}笔）")
+                return True
+            # connect failed 且仍有重试机会 → 等 session 释放后重试
+            if 'connect failed' in err and _attempt < _MAX_ATTEMPTS:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] ⚠️ 连接失败，"
+                      f"等待{_RETRY_WAIT:.0f}s后重试 ({_attempt}/{_MAX_ATTEMPTS})...")
+                _time.sleep(_RETRY_WAIT)
+                continue
+            # 其他失败或已用完重试次数
             detail = err if err else f"order_id={oid} 不在QMT列表({fids})"
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 买入委托失败: {code} — {detail}")
-        return ok
+            return False
 
     def _place_sell_order(self, code: str, qty: int, price: float) -> bool:
         if not _XT_OK or not _EXECUTOR_OK:
@@ -2048,19 +2135,29 @@ class LiveEngineV4:
                 raise RuntimeError(
                     f"xtquant 不可用，实盘拒绝卖出委托 {code}（避免假装下单）")
             return True  # 回测模式
-        print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程卖出: {code} "
-              f"price={price:.3f} qty={qty} → 启动独立下单进程...")
-        r = self._run_order_worker('sell', code, qty, price)
-        oid = r.get('oid', -1)
-        ok  = r.get('ok', False)
-        err = r.get('error', '')
-        if ok:
-            print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 卖出委托确认: "
-                  f"{code} order_id={oid} 已进入QMT委托列表")
-        else:
+        import time as _time
+        _MAX_ATTEMPTS = 2
+        _RETRY_WAIT   = 2.0
+        for _attempt in range(1, _MAX_ATTEMPTS + 1):
+            _retry_tag = f"（第{_attempt}次尝试）" if _attempt > 1 else ""
+            print(f"[{_now_str()}] [{self.ENGINE_NAME}] 子进程卖出: {code} "
+                  f"price={price:.3f} qty={qty} → 启动独立下单进程...{_retry_tag}")
+            r = self._run_order_worker('sell', code, qty, price)
+            oid = r.get('oid', -1)
+            ok  = r.get('ok', False)
+            err = r.get('error', '')
+            if ok:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 卖出委托确认: "
+                      f"{code} order_id={oid} 已进入QMT委托列表")
+                return True
+            if 'connect failed' in err and _attempt < _MAX_ATTEMPTS:
+                print(f"[{_now_str()}] [{self.ENGINE_NAME}] ⚠️ 连接失败，"
+                      f"等待{_RETRY_WAIT:.0f}s后重试 ({_attempt}/{_MAX_ATTEMPTS})...")
+                _time.sleep(_RETRY_WAIT)
+                continue
             detail = err if err else f"order_id={oid}"
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 卖出委托失败: {code} — {detail}")
-        return ok
+            return False
 
     # ─────────────────────────────────────────────
     # 状态持久化
@@ -2111,8 +2208,12 @@ class LiveEngineV4:
             'pending_sells': self.pending_sells,
             '_last_increment_date': self._last_increment_date,
             '_today_str': self._today_str,
+            '_cur_regime': self.cur_regime,
+            '_cur_max_pos': self.cur_max_pos,
             'last_update': _now_str(),
             'engine': 'V4',
+            'buy_candidates': list(self.buy_candidates),
+            'premarket_filtered': getattr(self, '_premarket_filtered', {}),
         }
         _save_json(STATE_FILE,   state)
         _save_json(QUEUE_FILE,   self.wait_queue)

@@ -155,6 +155,19 @@ def _print_v4_status():
     total_val  = state.get('total_value', cash)
     positions  = state.get('positions', {})
     last_upd   = state.get('last_update', 'N/A')
+    cur_regime = state.get('_cur_regime', '')
+    # regime 调整后的实际最大仓位（直接从 state 读取，避免导入引擎）
+    try:
+        from engine.live_engine_v4 import G34_PARAMS as _g34p
+        _regime_mp = {
+            'bull':           _g34p.get('bull_mp', 5),
+            'chop_init':      _g34p.get('chop_init_mp', 3),
+            'chop_else':      _g34p.get('chop_else_mp', 2),
+            'panic_30d':      0, 'vol_30d': 0, 'macro_bear_60d': 0,
+        }
+        _today_max_pos = _regime_mp.get(cur_regime, 5) if cur_regime else 5
+    except Exception:
+        _today_max_pos = 5
 
     pnl        = total_val - init_cap
     pnl_pct    = pnl / init_cap * 100 if init_cap > 0 else 0
@@ -164,7 +177,8 @@ def _print_v4_status():
     print(f"  当前现金:    {cash:>12,.2f} 元")
     print(f"  总资产:      {total_val:>12,.2f} 元")
     print(f"  累计盈亏:    {pnl:>+12,.2f} 元  ({pnl_pct:+.2f}%)")
-    print(f"  当前持仓:    {len(positions)} / 5 只")
+    print(f"  当前持仓:    {len(positions)} / {_today_max_pos} 只"
+          + (f"  [regime={cur_regime}]" if cur_regime else "  [regime=未知，重启引擎后更新]"))
 
     if positions:
         print()
@@ -262,7 +276,8 @@ def main():
 
     # ── --precompute（手动触发盘后预算）──
     if args.precompute:
-        _run_postmarket(force_ba=True)
+        print("[--precompute] 手动模式：跳过 19:00 等待，立即更新日线 + 重算 BA pool...")
+        _run_postmarket(force_ba=True, skip_wait=True, force_daily=True)
         return
 
     # ── 正常启动实盘 ──
@@ -316,29 +331,35 @@ def main():
         traceback.print_exc()
 
 
-def _run_postmarket(engine=None, force_ba: bool = False):
+def _run_postmarket(engine=None, force_ba: bool = False, skip_wait: bool = False, force_daily: bool = False):
     """
     收盘后标准流程：
-      1. 等待 19:00
+      1. 等待 19:00（skip_wait=True 时跳过）
       2. 更新日线数据（update_daily_data.py --force）
       3. 预算明日 BA pool（engine.postmarket_precompute）
-    engine: LiveEngineV4 实例（已运行完毕，daily_data 还在内存中）
+    engine: LiveEngineV4 实例（已运行完毕， daily_data 还在内存中）
     force_ba: True 时即使今日已预算也强制重跑
+    skip_wait: True 时跳过 19:00 等待（手动调用场景）
+    force_daily: True 时跳过日线哨兵文件检查，强制更新（昇晚忘运行时补轧）
     """
     import subprocess
     from engine.live_engine_v4 import LiveEngineV4
 
     # ── 等待至 19:00 ──
     print("\n" + "=" * 60)
-    print("[收盘后] 主循环结束，等待 19:00 更新日线数据...")
+    if skip_wait:
+        print("[盘后流程] skip_wait=True，跳过 19:00 等待，立即执行...")
+    else:
+        print("[盘后] 主循环结束，等待 19:00 更新日线数据...")
+        print("=" * 60)
+        _wait_until_19()
     print("=" * 60)
-    _wait_until_19()
 
     # ── 更新日线数据（幂等）──
     print("\n" + "=" * 60)
     print("[收盘后] 更新日线数据（D:/daily_data）...")
     print("=" * 60)
-    if _daily_data_updated_today():
+    if _daily_data_updated_today() and not force_daily:
         print("[收盘后] 日线数据今日已更新，跳过（幂等保护）")
     else:
         try:

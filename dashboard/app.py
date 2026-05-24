@@ -51,16 +51,9 @@ def _check_overheat_local(bare_code: str) -> tuple:
     global _overheat_cache, _overheat_cache_date
     import pandas as _pd_oh
 
-    # 加载参数
-    lookback  = 20
-    threshold = 0.40
-    try:
-        sys.path.insert(0, BASE_DIR)
-        import config as _cfg_oh
-        lookback  = getattr(_cfg_oh, 'V3_OVERHEAT_LOOKBACK',  lookback)
-        threshold = getattr(_cfg_oh, 'V3_OVERHEAT_THRESHOLD', threshold)
-    except Exception:
-        pass
+    # 引擎内置参数（不再依赖 config.py）
+    lookback  = 20    # 近20日
+    threshold = 0.40  # 累计涨幅超40%视为过热
 
     # 按日重置缓存
     today_str = _dt_now.today().strftime('%Y%m%d')
@@ -425,11 +418,7 @@ def create_app():
         # 优先用 state 文件里的 initial_capital，保证实盘/模拟各自独立
         initial_capital = state.get('initial_capital')
         if not initial_capital:
-            try:
-                import config as cfg
-                initial_capital = getattr(cfg, 'V3_INITIAL_CAPITAL', 300000)
-            except Exception:
-                initial_capital = 300000
+            initial_capital = 300000
 
         total_value = state.get('total_value', state.get('portfolio_value', 0))
         cash = state.get('cash', 0)
@@ -548,11 +537,11 @@ def create_app():
 
 
     def _get_board_info(code):
-        """返回 (board_name, threshold, limit_up_pct)"""
+        """返回 (board_name, min_chg, max_chg, limit_up_pct)"""
         c = str(code).split('.')[0]
         if c.startswith('688') or c.startswith('30'):
-            return '创业/科创板', 0.02, 0.198
-        return '主板', 0.01, 0.098
+            return '创业/科创板', 0.001, 0.055, 0.198
+        return '主板', 0.01, 0.035, 0.098
 
     def _get_tick_data(codes):
         """调用 xtdata.get_full_tick 获取实时行情，返回 {code: tick_dict}"""
@@ -621,9 +610,16 @@ def create_app():
         # 获取实时行情
         tick_map = _get_tick_data([bare for _, bare in raw_candidates])
 
+        # 读取引擎运行时状态：盘前候选列表 + 过滤原因（比 tick 检查更准确）
+        import os as _osp
+        _v4_state = _read_json(_osp.path.join(BASE_DIR, 'state_v4.json')) or {}
+        _engine_cands = set(_v4_state.get('buy_candidates', []))
+        _premarket_filtered = _v4_state.get('premarket_filtered', {})
+        _has_engine_state = bool(_engine_cands or _premarket_filtered)
+
         candidates = []
         for rank, bare in raw_candidates:
-            board_name, threshold, limit_up = _get_board_info(bare)
+            board_name, min_chg, max_chg, limit_up = _get_board_info(bare)
             # 过热检查（从本地日线 CSV 读取）
             _is_hot, _hot_reason = _check_overheat_local(bare)
             item = {
@@ -631,19 +627,46 @@ def create_app():
                 'name': _get_stock_name(bare),
                 'symbol': bare + ('.SH' if bare.startswith('6') else '.SZ'),
                 'board': board_name,
-                'buy_threshold': round(threshold * 100, 1),
+                'buy_min': round(min_chg * 100, 1),   # 买入涨幅下限
+                'buy_max': round(max_chg * 100, 1),   # 买入涨幅上限（防追高）
                 'last_price': None,
                 'pre_close': None,
                 'open': None,
                 'change_pct': None,
                 'is_positive': None,
                 'meets_buy_condition': False,
-                'status': '过热' if _is_hot else '无行情',
-                'pool_rank': rank,      # 池子原始排名（0=最高分）
+                'filter_reason': '过热' if _is_hot else '无行情',
+                'pool_rank': rank,
                 'is_overheat': _is_hot,
                 'overheat_reason': _hot_reason,
             }
             tick = tick_map.get(bare)
+            # ① 引擎状态优先：如果盘前过滤数据可用，且该股不在引擎候选列表里
+            if _has_engine_state and bare not in _engine_cands:
+                pm_reason = _premarket_filtered.get(bare, '盘前过滤')
+                # 仅获取行情用于价格展示， meets=False
+                if tick:
+                    try:
+                        _lp = tick.get('lastPrice') or tick.get('last_price') or 0
+                        _pc = tick.get('lastClose') or tick.get('pre_close') or tick.get('preClose') or 0
+                        _op = tick.get('open') or 0
+                        _chg = (_lp - _pc) / _pc * 100 if _pc > 0 else 0.0
+                        item.update({
+                            'last_price': round(_lp, 3),
+                            'pre_close':  round(_pc, 3),
+                            'open':       round(_op, 3),
+                            'change_pct': round(_chg, 2),
+                            'is_positive': _lp > _op if _op > 0 else None,
+                            'meets_buy_condition': False,
+                            'filter_reason': pm_reason,
+                        })
+                    except Exception:
+                        item['filter_reason'] = pm_reason
+                else:
+                    item['filter_reason'] = pm_reason
+                candidates.append(item)
+                continue
+            # ② 引擎候选或无引擎状态：tick 检查
             if tick and not _is_hot:
                 try:
                     last_price = tick.get('lastPrice') or tick.get('last_price') or 0
@@ -656,20 +679,29 @@ def create_app():
                         change_pct = 0.0
                     is_positive = last_price > open_price if open_price > 0 else None
                     limit_pct = limit_up * 100
-                    meets = (change_pct > threshold * 100) and (is_positive is True) and (change_pct < limit_pct)
-                    # 未开盘判断：volume=0（最可靠）或 open=0 均视为未开盘
+                    min_pct   = min_chg * 100
+                    max_pct   = max_chg * 100
+                    # 今开差过滤（gap_min = 0.5%）
+                    gap_pct = (open_price - pre_close) / pre_close * 100 if pre_close > 0 else 100.0
+                    gap_ok  = gap_pct >= 0.5
+                    meets = (change_pct > min_pct) and (change_pct < max_pct) and (is_positive is True) and (change_pct < limit_pct) and gap_ok
+                    # 未开盘判断
                     not_opened = (volume == 0 or open_price <= 0 or last_price <= 0)
-                    # 状态判断
+                    # 过滤原因判断（按优先级依次检查）
                     if not_opened:
-                        status = '待开市'
+                        filter_reason = '待开市'
                     elif change_pct >= limit_pct:
-                        status = '涨停'
+                        filter_reason = '涨停'
                     elif not is_positive:
-                        status = '收阴'
-                    elif change_pct <= threshold * 100:
-                        status = '涨幅不足'
+                        filter_reason = '收阴'
+                    elif change_pct <= min_pct:
+                        filter_reason = f'涨幅不足({change_pct:+.1f}%)'
+                    elif change_pct >= max_pct:
+                        filter_reason = f'防追高({change_pct:+.1f}%)'
+                    elif not gap_ok:
+                        filter_reason = f'今开差不足(+{gap_pct:.1f}%)'
                     else:
-                        status = '可买入'
+                        filter_reason = '可买入'
                     item.update({
                         'last_price': round(last_price, 3),
                         'pre_close':  round(pre_close, 3),
@@ -677,12 +709,12 @@ def create_app():
                         'change_pct': round(change_pct, 2),
                         'is_positive': is_positive,
                         'meets_buy_condition': meets,
-                        'status': status
+                        'filter_reason': filter_reason,
                     })
                 except Exception:
                     pass
             elif tick and _is_hot:
-                # 过热时仍返回行情数据，但 meets_buy_condition=False 且 status=过热
+                # 过热时仍返回行情数据
                 try:
                     last_price = tick.get('lastPrice') or tick.get('last_price') or 0
                     pre_close  = tick.get('lastClose') or tick.get('pre_close') or tick.get('preClose') or 0
@@ -697,7 +729,7 @@ def create_app():
                         'open':       round(open_price, 3),
                         'change_pct': round(change_pct, 2),
                         'meets_buy_condition': False,
-                        'status': '过热'
+                        'filter_reason': '过热',
                     })
                 except Exception:
                     pass
@@ -716,26 +748,71 @@ def create_app():
     def api_config():
         if request.method == 'POST':
             return jsonify({'ok': False, 'msg': '参数调整功能已禁用，请直接修改 live_engine_v4.py'}), 403
-        # GET: 读取 V4 引擎关键参数
+        # GET: 读取 V4 引擎全量参数（只读，引擎内置）
         try:
             from engine import live_engine_v4 as _v4
+            g = getattr(_v4, 'G34_PARAMS', {})
             data = {
-                'v4': {
-                    'hard_stop':     getattr(_v4, 'HARD_STOP',           0.08),
-                    'new_stock_hs':  getattr(_v4, 'NEW_STOCK_HARD_STOP', 0.08),
-                    'trail_act':     getattr(_v4, 'TRAIL_ACT',           0.28),
-                    'trail_stop':    getattr(_v4, 'TRAIL_STOP',          0.08),
-                    'max_positions': getattr(_v4, 'MAX_POSITIONS',       5),
-                    'ba_min_chg':    getattr(_v4, 'BA_MIN_CHG',          0.0),
-                    'ba_max_chg':    getattr(_v4, 'BA_MAX_CHG',          0.30),
-                    'cool_ret_max':  getattr(_v4, 'COOL_RET_MAX',        0.20),
-                    'vol_ratio_min': getattr(_v4, 'VOL_RATIO_MIN',       0.5),
-                    'vol_ratio_max': getattr(_v4, 'VOL_RATIO_MAX',       5.0),
-                    'gap_min':       getattr(_v4, 'GAP_MIN',             0.005),
-                }
+                'regime': {
+                    # Bull段 (SH指数 >= MA20)
+                    'bull_mp':        g.get('bull_mp',        5),
+                    'bull_hs':        g.get('bull_hs',        0.065),
+                    'bull_ta':        g.get('bull_ta',        0.40),
+                    'bull_ts':        g.get('bull_ts',        0.12),
+                    # Chop_init段 (跌破MA20初期)
+                    'chop_init_mp':   g.get('chop_init_mp',  4),
+                    'chop_init_hs':   g.get('chop_init_hs',  0.068),
+                    'chop_init_ta':   g.get('chop_init_ta',  0.24),
+                    'chop_init_ts':   g.get('chop_init_ts',  0.010),
+                    # Chop_else段 (跌破MA20末期)
+                    'chop_else_mp':   g.get('chop_else_mp',  3),
+                    'chop_else_hs':   g.get('chop_else_hs',  0.085),
+                    'chop_else_ta':   g.get('chop_else_ta',  0.22),
+                    'chop_else_ts':   g.get('chop_else_ts',  0.08),
+                    # 安全网
+                    'panic_thr':      g.get('panic_thr',     -0.06),
+                    'vol_thr':        g.get('vol_thr',       0.022),
+                    'macro_bear_thr': g.get('macro_bear_thr',-0.05),
+                },
+                'buy_filter': {
+                    'min_chg':       getattr(_v4, 'MIN_CHG',       0.01),
+                    'max_chg':       getattr(_v4, 'MAX_CHG',       0.035),
+                    'star_min_chg':  getattr(_v4, 'STAR_MIN_CHG',  0.001),
+                    'star_max_chg':  getattr(_v4, 'STAR_MAX_CHG',  0.055),
+                    'vol_ratio_min': getattr(_v4, 'VOL_RATIO_MIN', 1.5),
+                    'vol_ratio_max': getattr(_v4, 'VOL_RATIO_MAX', 3.0),
+                    'gap_min':       getattr(_v4, 'GAP_MIN',       0.005),
+                    'ba_min_chg':    getattr(_v4, 'BA_MIN_CHG',    0.01),
+                    'ba_max_chg':    getattr(_v4, 'BA_MAX_CHG',    0.07),
+                    'cool_lookback': getattr(_v4, 'COOL_DAYS_MAX', 20),
+                },
+                'fees': {
+                    'commission_rate': getattr(_v4, 'COMMISSION_RATE', 0.0000854),
+                    'stamp_tax':       getattr(_v4, 'STAMP_TAX_RATE',  0.0005),
+                    'slippage':        getattr(_v4, 'SLIPPAGE',        0.00015),
+                },
+                # 兼容字段：供 renderPositions 计算持仓止损/止盈显示
+                'main_board': {
+                    'hard_stop_loss':    g.get('bull_hs', 0.065),
+                    'trailing_activate': g.get('bull_ta', 0.40),
+                    'trailing_stop':     g.get('bull_ts', 0.12),
+                },
+                'star_board': {
+                    'hard_stop_loss':    g.get('bull_hs', 0.065),
+                    'trailing_activate': g.get('bull_ta', 0.40),
+                    'trailing_stop':     g.get('bull_ts', 0.12),
+                },
             }
         except Exception as e:
             data = {'error': str(e)}
+        # 读取上证安全网状态（由 init_rebalance_pool.py 建池时计算写入）
+        try:
+            import os as _osp
+            _rb_path = _osp.join(_osp.dirname(__file__), 'state_v3_rebalance.json')
+            _rb = _read_json(_rb_path) or {}
+            data['sh_status'] = _rb.get('sh_status', {})
+        except Exception:
+            data.setdefault('sh_status', {})
         return jsonify(data)
 
     # ==================== 进程监控接口 ====================
