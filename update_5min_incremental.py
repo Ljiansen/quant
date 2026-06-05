@@ -10,8 +10,10 @@ update_5min_incremental.py
   - 对新股（文件不存在）从 NEW_STOCK_START 开始全量下载
 
 用法:
-    python update_5min_incremental.py          # 增量更新所有已有文件
-    python update_5min_incremental.py --full   # 强制全量重新下载（覆盖）
+    python update_5min_incremental.py                # 增量更新所有已有文件
+    python update_5min_incremental.py --full         # 强制全量重新下载（覆盖）
+    python update_5min_incremental.py --pool-only    # 仅更新最新BA调仓池50只
+    python update_5min_incremental.py --pool-only --pool-date 2026-05-18  # 指定日期的BA池
 """
 
 import os
@@ -153,8 +155,44 @@ def _download_one(code: str, start: str, end: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def get_ba_pool_codes(pool_date: str = None) -> list:
+    """
+    从最新（或指定日期）的 ba_pool_v4_{date}.json 读取调仓池股票代码。
+    pool_date: 'YYYY-MM-DD'，不传则自动取最新文件。
+    返回股票代码列表（6位字符串）。
+    """
+    import glob, json
+    if pool_date:
+        fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f'ba_pool_v4_{pool_date}.json')
+        if not os.path.exists(fpath):
+            _log(f'[错误] 指定的BA池文件不存在: {fpath}')
+            return []
+    else:
+        pattern = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'ba_pool_v4_*.json')
+        files = sorted(glob.glob(pattern))
+        if not files:
+            _log('[错误] 未找到任何 ba_pool_v4_*.json 文件')
+            return []
+        fpath = files[-1]
+
+    _log(f'[BA池] 读取调仓池文件: {os.path.basename(fpath)}')
+    with open(fpath, encoding='utf-8') as f:
+        d = json.load(f)
+    pool = d.get('pool', [])
+    # pool 格式: [[code, rank, score], ...]  或 [code, ...]
+    codes = []
+    for item in pool:
+        if isinstance(item, (list, tuple)):
+            codes.append(str(item[0]).zfill(6))
+        else:
+            codes.append(str(item).zfill(6))
+    _log(f'[BA池] 共 {len(codes)} 只: {codes}')
+    return codes
+
+
 def get_all_local_codes() -> list:
-    """扫描 D:/daily_data 返回所有股票代码"""
     codes = []
     for sub in ('SH', 'SZ'):
         d = os.path.join(DAILY_DATA_DIR, sub)
@@ -184,7 +222,7 @@ def get_existing_codes() -> list:
     return sorted(codes)
 
 
-def run_incremental(force_full=False):
+def run_incremental(force_full=False, pool_only=False, pool_date=None):
     """主流程：增量更新所有已有文件，新增文件全量下载"""
     # 在运行时获取当前日期（而非模块导入时），避免跨日运行时日期错误
     today_str = datetime.date.today().strftime('%Y-%m-%d')
@@ -193,11 +231,28 @@ def run_incremental(force_full=False):
 
     _log('=' * 60)
     _log(f'5分钟线增量更新任务启动  目标日期: {today_str}')
-    _log(f'  force_full={force_full}')
+    _log(f'  force_full={force_full}  pool_only={pool_only}')
     _log('=' * 60)
 
     existing_codes = set(get_existing_codes())
     _log(f'已有5分钟数据: {len(existing_codes)} 只')
+
+    # pool_only 模式：只取 BA 调仓池的 50 只
+    if pool_only:
+        ba_codes = set(get_ba_pool_codes(pool_date))
+        if not ba_codes:
+            _log('[错误] BA池为空，退出')
+            return
+        # 交集：只更新已有文件中的调仓池股票（避免给新股全量下载）
+        target_codes = existing_codes & ba_codes
+        # 调仓池中若有新股（5min文件不存在），也给它全量下载
+        new_pool_codes = ba_codes - existing_codes
+        if new_pool_codes:
+            _log(f'[BA池] 新股（无5min文件）将全量下载: {sorted(new_pool_codes)}')
+        target_codes = target_codes | new_pool_codes
+        _log(f'[BA池] 本次仅更新 {len(target_codes)} 只调仓池股票')
+    else:
+        target_codes = existing_codes
 
     # 登录 baostock
     lg = bs.login()
@@ -208,10 +263,10 @@ def run_incremental(force_full=False):
     _log('[baostock] 登录成功，开始增量更新...')
 
     done = skip = fail = 0
-    total = len(existing_codes)
+    total = len(target_codes)
 
     try:
-        for i, code in enumerate(sorted(existing_codes), 1):
+        for i, code in enumerate(sorted(target_codes), 1):
             fpath = _fivemin_path(code)
 
             if force_full:
@@ -272,5 +327,9 @@ def run_incremental(force_full=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='5分钟线增量更新')
     parser.add_argument('--full', action='store_true', help='强制全量重新下载（覆盖现有文件）')
+    parser.add_argument('--pool-only', action='store_true',
+                        help='仅更新最新BA调仓池50只（约30秒，适合盘后快速补全）')
+    parser.add_argument('--pool-date', type=str, default=None,
+                        help='指定BA池日期 YYYY-MM-DD，不传则自动取最新文件')
     args = parser.parse_args()
-    run_incremental(force_full=args.full)
+    run_incremental(force_full=args.full, pool_only=args.pool_only, pool_date=args.pool_date)

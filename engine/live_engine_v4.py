@@ -692,8 +692,9 @@ class LiveEngineV4:
             self._on_new_day(today_str)
 
         try:
-            # ── 09:00~09:14 盘前处理 ──
-            if h == 9 and m < 15:
+            # ── 08:30~09:14 盘前处理 ──
+            _t_min = h * 60 + m
+            if 8 * 60 + 30 <= _t_min < 9 * 60 + 15:
                 if not self._premarket_done:
                     self._premarket_build(today_str)
                     self._premarket_done = True
@@ -1639,6 +1640,28 @@ class LiveEngineV4:
     # 买入/卖出执行
     # ─────────────────────────────────────────────
 
+    def _get_tick_prices(self) -> Dict[str, float]:
+        """获取持仓最新 tick 价格（用于 _save_state 计算 total_value，与 Dashboard 口径一致）"""
+        if not (_XT_OK and _xtdata is not None):
+            return {}
+        result: Dict[str, float] = {}
+        symbols = [_format_symbol(c) for c in self.positions]
+        if not symbols:
+            return result
+        try:
+            ticks = _xtdata.get_full_tick(symbols)
+            if ticks:
+                for code in self.positions:
+                    sym = _format_symbol(code)
+                    tick = ticks.get(sym)
+                    if tick:
+                        lp = float(tick.get('lastPrice', 0) or 0)
+                        if lp > 0:
+                            result[code] = lp
+        except Exception:
+            pass
+        return result
+
     def _route_buy_price(self, code: str, bar_c: float) -> float:
         """V3风格实时价智能路由：获取卖一价，决定买入委托价（精确到0.01元）。
         规则（与 V3 live_engine_v3.py L1381-1408 对齐）：
@@ -1786,18 +1809,19 @@ class LiveEngineV4:
         if qty <= 0:
             return
 
-        net, commission, stamp_tax = _sell_net(sell_price, qty)
-        pnl = net - pos['buy_price'] * qty
-
         # V3风格实时价路由：止损用买一价，确保快速成交；降级用 sell_price - SLIPPAGE
         actual_sell = self._route_sell_price(code, sell_price)
         ok = self._place_sell_order(code, qty, actual_sell)
         if not ok:
             return
 
+        # 用实际成交价计算净收入和盈亏（而非信号价）
+        net, commission, stamp_tax = _sell_net(actual_sell, qty)
+        pnl = net - pos['buy_price'] * qty
+
         self.cash += net
         slip_amt = round(sell_price - actual_sell, 4)
-        self._log_trade('sell', code, sell_price, qty, reason,
+        self._log_trade('sell', code, actual_sell, qty, reason,
                         fee=commission + stamp_tax, pnl=pnl,
                         cash_after=self.cash,
                         days_held=pos.get('days_held', 0),
@@ -1808,16 +1832,20 @@ class LiveEngineV4:
                         trigger_hm=f"{hm[0]:02d}:{hm[1]:02d}" if hm else None,
                         buy_price_ref=round(pos.get('buy_price', 0), 4),
                         buy_date_ref=pos.get('buy_date', ''),
+                        snapshot_hs=pos.get('snapshot_hs'),
+                        snapshot_ta=pos.get('snapshot_ta'),
+                        snapshot_ts=pos.get('snapshot_ts'),
                         snapshot_regime=pos.get('snapshot_regime', ''),
+                        snapshot_max_pos=pos.get('snapshot_max_pos'),
                         bars_5min=pos.get('history', {}).get('bars_5min', []))
         del self.positions[code]
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 卖出: {code} "
-              f"原因={reason} 价={sell_price:.3f} 数量={qty} "
+              f"原因={reason} 成交价={actual_sell:.3f}(信号{sell_price:.3f}) 数量={qty} "
               f"PnL={pnl:+.2f} 现金={self.cash:.2f}")
         if _NOTIFIER_OK:
             try:
-                _notify_sell(code=code, price=sell_price, qty=qty,
+                _notify_sell(code=code, price=actual_sell, qty=qty,
                              reason=reason, pnl=pnl)
             except Exception:
                 pass
@@ -2184,15 +2212,20 @@ class LiveEngineV4:
             return  # 5 秒内合并，不写盘
         self._last_save_ts = now_ts
     
-        # 计算总价値（用最新bar估算）
+        # 计算总价値（优先用 tick 实时价，与 Dashboard 口径一致）
+        _tick_prices = self._get_tick_prices() if self.positions else {}
         pos_value = 0.0
         for code, pos in self.positions.items():
-            bars = self.bars_today.get(code, {})
-            if bars:
-                latest = bars[max(bars.keys())]
-                pos_value += latest['close'] * pos['quantity']
+            tick_px = _tick_prices.get(code, 0)
+            if tick_px > 0:
+                pos_value += tick_px * pos['quantity']
             else:
-                pos_value += pos['buy_price'] * pos['quantity']
+                bars = self.bars_today.get(code, {})
+                if bars:
+                    latest = bars[max(bars.keys())]
+                    pos_value += latest['close'] * pos['quantity']
+                else:
+                    pos_value += pos['buy_price'] * pos['quantity']
     
         # P2-2: 剥离 history 字段（history.bars_5min 只在内存用，不持久化避免膟胀）
         state_positions = {
@@ -2200,6 +2233,31 @@ class LiveEngineV4:
             for code, pos in self.positions.items()
         }
     
+        # 构建 sh_status（上证安全网状态，供 Dashboard 实时展示）
+        _sh_status = {}
+        _prev = self._prev_trading_date(self._today_str) if self._today_str else None
+        _feat = self.sh_g34_cache.get(_prev) if _prev else None
+        if _feat:
+            _p = G34_PARAMS
+            _sn_regime = self.cur_regime
+            _sn_any = _sn_regime in ('panic_30d', 'vol_30d', 'macro_bear_60d', 'chop_else_ret5')
+            _sh_status = {
+                'date':             _prev,
+                'ret_5d':           round(_feat.get('ret_5d', 0) * 100, 2),
+                'ret_30d':          round(_feat.get('ret_30d', 0) * 100, 2),
+                'vol_30d':          round(_feat.get('vol_30d', 0) * 100, 3),
+                'ret_60d':          round(_feat.get('ret_60d', 0) * 100, 2),
+                'below_ma20':       _feat.get('below', False),
+                'streak':           _feat.get('streak', 0),
+                'close_gt_ma60':    _feat.get('close_gt_ma60', False),
+                'panic_triggered':  _feat.get('ret_30d', 0) < _p['panic_thr'],
+                'vol_triggered':    _feat.get('vol_30d', 0) > _p['vol_thr'],
+                'macro_triggered':  _feat.get('ret_60d', 0) < _p['macro_bear_thr'],
+                'ret5_triggered':   _feat.get('ret_5d', 0) < _p.get('chop_else_ret5_min', -0.01),
+                'any_triggered':    _sn_any,
+                'regime':           _sn_regime,
+            }
+
         state = {
             'initial_capital': self.initial_capital,
             'cash': round(self.cash, 2),
@@ -2214,6 +2272,7 @@ class LiveEngineV4:
             'engine': 'V4',
             'buy_candidates': list(self.buy_candidates),
             'premarket_filtered': getattr(self, '_premarket_filtered', {}),
+            'sh_status': _sh_status,
         }
         _save_json(STATE_FILE,   state)
         _save_json(QUEUE_FILE,   self.wait_queue)

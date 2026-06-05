@@ -1079,6 +1079,7 @@ function _cfgRender(data) {
     row1('恐慌止损', `ret_30d &lt; ${pct(r.panic_thr)}   ${_snVal(_s.panic_triggered, _s.ret_30d, '%')}`, '上证近<b>30日涨跌幅</b> &lt; &minus;6%，市场处于急速下跌段，停止新买入'),
     row1('波动过大', `vol_30d &gt; ${pct(r.vol_thr)}   ${_snVal(_s.vol_triggered, _s.vol_30d, '%')}`, '上证近30日日收益率<b>标准差（年化）</b> &gt; 2.2%，波动率过高，停止新买入'),
     row1('宏观熊市', `ret_60d &lt; ${pct(r.macro_bear_thr)}   ${_snVal(_s.macro_triggered, _s.ret_60d, '%')}`, '上证近<b>60日涨跌幅</b> &lt; &minus;5%，宏观趋势偏空，停止新买入'),
+    row1('5日阴跌', `ret_5d &lt; ${pct((r.chop_else_ret5_min || -0.01))}   ${_snVal(_s.ret5_triggered, _s.ret_5d, '%')}`, 'Chop末段时上证近<b>5日涨跌幅</b> &lt; &minus;1%，阴跌趋势中停止新买入（max_pos=0）'),
     secHdr('买入过滤',
       `<span class="tooltip-title">5分钟K线买入过滤条件</span>
        <div>每根5分钟K线<b>依次检查</b>以下条件，全部通过才执行买入，任一不满足则跳过该K线</div>`),

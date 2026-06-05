@@ -387,6 +387,59 @@ def main(strategy: str = 'ba'):
     result_df = result_df.head(top_n)
     pool = result_df['code'].tolist()
 
+    # [4.5] 计算上证安全网状态（与建池一起写入，供 Dashboard 展示触发情况）
+    print("\n[4.5] 计算上证安全网状态...")
+    _sh_status = {}
+    try:
+        _sh_df = get_stock_data('000001', data_dir, '20220101', rebalance_date_ymd)
+        if _sh_df is not None and not _sh_df.empty and len(_sh_df) >= 61:
+            from engine.live_engine_v4 import _load_sh_features_g34, G34_PARAMS as _G34P
+            _sh_cache = _load_sh_features_g34(_sh_df)
+            _feat = _sh_cache.get(rebalance_date)
+            if _feat:
+                _p = _G34P
+                _cur_init_bnd = _p['init_bnd_bull'] if _feat.get('close_gt_ma60') else _p['init_bnd_chop']
+                if _feat['ret_30d'] < _p['panic_thr']:
+                    _sn_regime = 'panic_30d'
+                elif _feat['vol_30d'] > _p['vol_thr']:
+                    _sn_regime = 'vol_30d'
+                elif _feat['ret_60d'] < _p['macro_bear_thr']:
+                    _sn_regime = 'macro_bear_60d'
+                elif not _feat['below']:
+                    _sn_regime = 'bull'
+                elif _feat['streak'] <= _cur_init_bnd:
+                    _sn_regime = 'chop_init'
+                elif _feat['ret_5d'] < _p.get('chop_else_ret5_min', -0.01):
+                    _sn_regime = 'chop_else_ret5'
+                else:
+                    _sn_regime = 'chop_else'
+                _sn_any = _sn_regime in ('panic_30d', 'vol_30d', 'macro_bear_60d', 'chop_else_ret5')
+                _sh_status = {
+                    'date':          rebalance_date,
+                    'ret_5d':        round(_feat['ret_5d']  * 100, 2),
+                    'ret_30d':       round(_feat['ret_30d'] * 100, 2),
+                    'vol_30d':       round(_feat['vol_30d'] * 100, 3),
+                    'ret_60d':       round(_feat['ret_60d'] * 100, 2),
+                    'below_ma20':    _feat['below'],
+                    'streak':        _feat['streak'],
+                    'close_gt_ma60': _feat.get('close_gt_ma60', False),
+                    'panic_triggered': _feat['ret_30d'] < _p['panic_thr'],
+                    'vol_triggered':   _feat['vol_30d'] > _p['vol_thr'],
+                    'macro_triggered': _feat['ret_60d'] < _p['macro_bear_thr'],
+                    'ret5_triggered':  _feat['ret_5d'] < _p.get('chop_else_ret5_min', -0.01),
+                    'any_triggered':   _sn_any,
+                    'regime':          _sn_regime,
+                }
+                _sn_label = '⚠️ 已触发 → 空仓' if _sn_any else '✅ 未触发'
+                print(f"  ret_30d={_sh_status['ret_30d']:+.2f}%  vol_30d={_sh_status['vol_30d']:.3f}%  ret_60d={_sh_status['ret_60d']:+.2f}%  ret_5d={_sh_status['ret_5d']:+.2f}%")
+                print(f"  安全网: {_sn_label}  Regime: {_sn_regime}  MA20位置: {'低于' if _feat['below'] else '高于'}MA20 (连续{_feat['streak']}天)")
+            else:
+                print(f"  [警告] 未找到 {rebalance_date} 的上证特征数据")
+        else:
+            print(f"  [警告] 上证日线数据不足，跳过安全网状态计算")
+    except Exception as _she:
+        print(f"  [警告] 上证安全网状态计算失败: {_she}")
+
     # 5. 输出文件
     output = {
         'pool':            pool,
@@ -395,6 +448,7 @@ def main(strategy: str = 'ba'):
         'strategy':        sinfo['name'],
         'min_chg':         min_chg,
         'max_chg':         max_chg,
+        'sh_status':       _sh_status,   # 上证安全网状态
     }
     output_path = 'd:/miniqmt_quant/state_v3_rebalance.json'
 

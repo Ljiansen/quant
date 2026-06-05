@@ -38,6 +38,9 @@ LOG_FILE   = 'd:/miniqmt_quant/logs/update_daily_data.log'
 DELAY_MIN  = 0.05
 DELAY_MAX  = 0.15
 
+# 项目根目录（用于定位 state_v4.json 等文件）
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+
 # CSV 列名（与现有本地数据保持一致，volumn 是 xtquant 原始拼写）
 CSV_COLS   = ['timetag', 'open', 'high', 'low', 'close', 'volumn', 'amount']
 
@@ -296,17 +299,24 @@ def update_sh_index(start_yyyymmdd: str, end_yyyymmdd: str) -> bool:
 # ──────────────────────────────────────────────────────────────
 
 def update_existing(codes: list[str], start_yyyymmdd: str,
-                    end_yyyymmdd: str) -> tuple[int, int, int]:
+                    end_yyyymmdd: str,
+                    skip_codes: set = None) -> tuple[int, int, int]:
     """
     批量更新已有股票 CSV 文件。
+    skip_codes: 跳过的股票集合（如除权股票，将单独全量重下）
     返回 (success, skipped, failed)
     """
     total   = len(codes)
     success = 0
     skipped = 0
     failed  = 0
+    skip_codes = skip_codes or set()
 
     for i, code in enumerate(codes, 1):
+        if code in skip_codes:
+            skipped += 1
+            continue
+
         if i % 100 == 0 or i == 1 or i == total:
             log.info(f'  进度: {i}/{total}  成功={success} 跳过={skipped} 失败={failed}')
 
@@ -389,6 +399,163 @@ def add_new_stocks(start_yyyymmdd: str, end_yyyymmdd: str,
 
 
 # ──────────────────────────────────────────────────────────────
+# 除权检测与处理
+# ──────────────────────────────────────────────────────────────
+
+def query_dividends_today(today_str: str) -> dict:
+    """
+    查询今天发生除权除息的股票。
+    仅检查当前持仓的股票（baostock query_dividend_data 需逐只查询 code）。
+    today_str: 'YYYY-MM-DD'
+    返回 {code: {ex_date, factor, bonus, transfer, cash_div, plan}}
+    """
+    import baostock as bs
+    _bs_ensure_login()
+
+    year = today_str[:4]
+    events = {}
+
+    # 检查范围：当前持仓 + 近期交易过的股票
+    state_path = os.path.join(BASE_DIR, 'state_v4.json')
+    trades_path = os.path.join(BASE_DIR, 'trades_v4.json')
+    check_codes = set()
+
+    # 持仓股票
+    if os.path.exists(state_path):
+        import json
+        with open(state_path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        check_codes.update(state.get('positions', {}).keys())
+
+    # 近期交易过的股票（trades_v4.json 中最近 30 天的记录）
+    if os.path.exists(trades_path):
+        import json
+        from datetime import datetime as _dt, timedelta as _td
+        with open(trades_path, 'r', encoding='utf-8') as f:
+            trades = json.load(f)
+        cutoff = (_dt.now() - _td(days=30)).strftime('%Y-%m-%d')
+        for t in trades:
+            if t.get('timestamp', '') >= cutoff:
+                check_codes.add(t.get('code', ''))
+
+    if not check_codes:
+        log.info('无持仓/近期交易股票，跳过除权检测')
+        return events
+
+    log.info(f'检查 {len(check_codes)} 只股票（持仓+近期交易）的除权事件')
+
+    for code in check_codes:
+        try:
+            bs_code = f'sh.{code}' if code.startswith('6') else f'sz.{code}'
+            rs = bs.query_dividend_data(code=bs_code, year=year)
+            while rs.error_code == '0' and rs.next():
+                row = rs.get_row_data()
+                fields = rs.fields
+                d = dict(zip(fields, row))
+
+                ex_date = d.get('dividOperateDate', '')
+                if ex_date != today_str:
+                    continue
+
+                bonus    = float(d.get('dividStocksPs', 0) or 0)
+                transfer = float(d.get('dividReserveToStockPs', 0) or 0)
+                cash_div = float(d.get('dividCashPsBeforeTax', 0) or 0)
+
+                factor = 1.0 + bonus + transfer
+                if factor <= 1.0 and cash_div <= 0:
+                    continue
+
+                events[code] = {
+                    'ex_date':   ex_date,
+                    'factor':    round(factor, 6),
+                    'bonus':     bonus,
+                    'transfer':  transfer,
+                    'cash_div':  cash_div,
+                    'plan':      d.get('dividCashStock', ''),
+                    'reg_date':  d.get('dividRegistDate', ''),
+                }
+        except Exception as e:
+            log.warning(f'  {code} 除权查询失败: {e}')
+
+    if events:
+        log.info(f'今日({today_str})除权除息股票: {len(events)} 只')
+        for code, ev in events.items():
+            log.info(f'  {code}: {ev["plan"]}  复权因子={ev["factor"]:.4f}')
+    return events
+
+
+def reprocess_ex_rights_stocks(today_str: str, events: dict) -> None:
+    """
+    对发生除权的股票：全量重新下载日线 + 调整 state_v4.json 持仓。
+    """
+    if not events:
+        return
+
+    affected_codes = list(events.keys())
+    log.info(f'除权检测: {len(affected_codes)} 只股票需要处理')
+
+    # 1. 全量重下日线数据
+    for i, code in enumerate(affected_codes, 1):
+        if i % 50 == 0:
+            log.info(f'  重下进度: {i}/{len(affected_codes)}')
+        try:
+            df = fetch_bs_hist(code, '20200101', today_str.replace('-', ''))
+            if not df.empty:
+                path = _get_file_path(code)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                df.to_csv(path, index=False)
+                log.info(f'  {code}: 全量重下完成 ({len(df)} 行)')
+            else:
+                log.warning(f'  {code}: 重下数据为空')
+        except Exception as e:
+            log.warning(f'  {code}: 重下失败 ({e})')
+        time.sleep(DELAY_MIN + random.random() * (DELAY_MAX - DELAY_MIN))
+
+    # 2. 调整 state_v4.json 持仓
+    state_path = os.path.join(BASE_DIR, 'state_v4.json')
+    if not os.path.exists(state_path):
+        log.warning(f'state 文件不存在: {state_path}')
+        return
+
+    import json
+    with open(state_path, 'r', encoding='utf-8') as f:
+        state = json.load(f)
+
+    positions = state.get('positions', {})
+    adjusted = 0
+
+    for code, ev in events.items():
+        if code not in positions:
+            continue
+        pos = positions[code]
+        factor = ev['factor']
+        if factor <= 1.0:
+            continue
+
+        old_bp = pos.get('buy_price', 0)
+        old_hp = pos.get('highest_price', 0)
+        old_qty = pos.get('quantity', 0)
+
+        pos['buy_price']     = round(old_bp / factor, 3)
+        pos['highest_price'] = round(old_hp / factor, 3)
+        pos['quantity']      = int(round(old_qty * factor))
+
+        log.info(
+            f'  持仓调整 {code}: '
+            f'factor={factor:.4f}  '
+            f'buy_price {old_bp:.3f}→{pos["buy_price"]:.3f}  '
+            f'qty {old_qty}→{pos["quantity"]}'
+        )
+        adjusted += 1
+
+    if adjusted > 0:
+        state['last_update'] = today_str + ' ex-rights'
+        with open(state_path, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        log.info(f'state_v4.json 已更新 ({adjusted} 只持仓调整)')
+
+
+# ──────────────────────────────────────────────────────────────
 # 主入口
 # ──────────────────────────────────────────────────────────────
 
@@ -434,27 +601,39 @@ def main():
     codes = get_all_local_codes()
     log.info(f'本地股票总数: {len(codes)}')
 
-    # 预计耗时提示（baostock 每次约 0.1s）
-    est_min = round(len(codes) * ((DELAY_MIN + DELAY_MAX) / 2 + 0.1) / 60, 1)
-    log.info(f'预计耗时: ~{est_min} 分钟')
-
     # baostock 登录
     _bs_ensure_login()
     log.info('baostock 登录成功')
 
-    # 执行增量更新
+    # ── Step 1: 除权检测（前置，避免增量更新白跑）──
+    today_fmt = f'{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}'
+    log.info('── 除权检测 ──')
+    div_events = query_dividends_today(today_fmt)
+    ex_rights_codes = set(div_events.keys()) if div_events else set()
+    if ex_rights_codes:
+        log.info(f'检测到 {len(ex_rights_codes)} 只除权股票，增量更新时将跳过')
+    else:
+        log.info('今日无除权事件')
+
+    # ── Step 2: 增量更新（跳过除权股票）──
+    est_min = round(len(codes) * ((DELAY_MIN + DELAY_MAX) / 2 + 0.1) / 60, 1)
+    log.info(f'预计耗时: ~{est_min} 分钟')
+
     t0 = time.time()
-    success, skipped, failed = update_existing(codes, start_date, end_date)
+    success, skipped, failed = update_existing(codes, start_date, end_date,
+                                               skip_codes=ex_rights_codes)
     elapsed = (time.time() - t0) / 60
 
-    # baostock 登出
     _bs_logout()
-
     log.info(f'增量更新完成: 成功={success} 跳过={skipped} 失败={failed}，耗时 {elapsed:.1f} 分钟')
 
-    # 上证指数单独更新
+    # ── Step 3: 上证指数更新 ──
     log.info('── 更新上证指数 ──')
     update_sh_index(start_date, end_date)
+
+    # ── Step 4: 除权股票全量重下 + state 持仓调整 ──
+    if div_events:
+        reprocess_ex_rights_stocks(today_fmt, div_events)
 
     # 可选：添加新股
     if args.add_new:

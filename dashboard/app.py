@@ -773,6 +773,7 @@ def create_app():
                     'panic_thr':      g.get('panic_thr',     -0.06),
                     'vol_thr':        g.get('vol_thr',       0.022),
                     'macro_bear_thr': g.get('macro_bear_thr',-0.05),
+                    'chop_else_ret5_min': g.get('chop_else_ret5_min', -0.01),
                 },
                 'buy_filter': {
                     'min_chg':       getattr(_v4, 'MIN_CHG',       0.01),
@@ -805,12 +806,17 @@ def create_app():
             }
         except Exception as e:
             data = {'error': str(e)}
-        # 读取上证安全网状态（由 init_rebalance_pool.py 建池时计算写入）
+        # 读取上证安全网状态：优先从 state_v4.json（引擎每次保存更新），降级到建池文件
         try:
-            import os as _osp
-            _rb_path = _osp.join(_osp.dirname(__file__), 'state_v3_rebalance.json')
-            _rb = _read_json(_rb_path) or {}
-            data['sh_status'] = _rb.get('sh_status', {})
+            _state_sh = _read_json(os.path.join(BASE_DIR, 'state_v4.json')) or {}
+            _sh_from_state = _state_sh.get('sh_status', {})
+            if _sh_from_state and _sh_from_state.get('date'):
+                data['sh_status'] = _sh_from_state
+            else:
+                import os as _osp
+                _rb_path = _osp.join(_osp.dirname(__file__), 'state_v3_rebalance.json')
+                _rb = _read_json(_rb_path) or {}
+                data['sh_status'] = _rb.get('sh_status', {})
         except Exception:
             data.setdefault('sh_status', {})
         return jsonify(data)
