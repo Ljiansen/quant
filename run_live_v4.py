@@ -337,6 +337,7 @@ def _run_postmarket(engine=None, force_ba: bool = False, skip_wait: bool = False
       1. 等待 19:00（skip_wait=True 时跳过）
       2. 更新日线数据（update_daily_data.py --force）
       3. 预算明日 BA pool（engine.postmarket_precompute）
+      4. 检测 T/C1 信号 + 钉钉通知
     engine: LiveEngineV4 实例（已运行完毕， daily_data 还在内存中）
     force_ba: True 时即使今日已预算也强制重跑
     skip_wait: True 时跳过 19:00 等待（手动调用场景）
@@ -396,6 +397,19 @@ def _run_postmarket(engine=None, force_ba: bool = False, skip_wait: bool = False
             print(f"[收盘后] BA pool 预算失败（不影响今日交易）: {e}")
             traceback.print_exc()
 
+    # ── T/C1 信号检测 + 钉钉通知 ──
+    print("\n" + "=" * 60)
+    print("[收盘后] 检测 T/C1 信号...")
+    print("=" * 60)
+    try:
+        from check_signal_notify import check_signals, notify_signals
+        sig_result = check_signals()
+        notify_signals(sig_result)
+        print("[收盘后] T/C1 信号检测完成 ✓")
+    except Exception as e:
+        import traceback
+        print(f"[收盘后] T/C1 信号检测失败: {e}")
+        traceback.print_exc()
 
 if __name__ == '__main__':
     main()

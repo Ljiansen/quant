@@ -33,14 +33,14 @@ T_MIN_AVG_AMOUNT      = 3e8     # 20 日均成交额 > 3 亿
 T_MIN_PRICE           = 5.0     # 最低价格
 T_MAX_PRICE           = 200.0   # 最高价格
 T_EXCLUDE_PREFIXES    = ('688', '301', '001', '689')  # 排除前缀
-T_HOLD_DAYS           = 8       # 最大持仓天数
+T_HOLD_DAYS           = 15      # 最大持仓天数
 T_TRAILING_ACTIVATION = 0.12    # trailing 激活阈值（浮盈 12%）
 T_TRAILING_STOP_PCT   = 0.06    # trailing 回落幅度（6%）
 T_BUY_SLIPPAGE        = 0.015   # 买入滑点 1.5%
 T_SELL_SLIPPAGE       = 0.01    # 卖出滑点 1%
 T_COMMISSION          = 0.00025 # 佣金 0.025%
 T_STAMP_TAX           = 0.0005  # 印花税 0.05%（卖出）
-T_LIMIT_THRESHOLD     = 0.095   # 涨停判定阈值
+# T_LIMIT_THRESHOLD 已废弃，改用 _get_limit_threshold() 函数
 T_SIGNAL_COOLDOWN     = 10      # 信号去重天数
 
 # 日线数据目录（与 BA 共享同一物理目录，独立读取）
@@ -55,6 +55,12 @@ T_TRADES_FILE = os.path.join(BASE_DIR, 'trades_t_v4.json')
 # ═══════════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════════
+
+def _get_limit_threshold(code: str) -> float:
+    """创业板(300/301)/科创板(688/689)涨跌停20%, 主板10%"""
+    if code.startswith(('300', '301', '688', '689')):
+        return 0.195
+    return 0.095
 
 def _now_str() -> str:
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -300,11 +306,12 @@ class StrategyTEngine:
                 executed.append(code)
                 continue
 
-            # 涨停检查：开盘价相对昨收涨幅 >= 9.5% 跳过
+            # 涨跌停检查：开盘价相对昨收涨幅 >= 阈值 跳过（创业板/科创板20%，主板10%）
             prev_rows  = df[df['date'] < today_dt]
             prev_close = float(prev_rows['close'].iloc[-1]) if not prev_rows.empty else 0
-            if prev_close > 0 and (open_price / prev_close - 1) >= T_LIMIT_THRESHOLD:
-                print(f"[{_now_str()}] [策略T] [DBG-T] {code} 涨停跳过 "
+            code_limit = _get_limit_threshold(code)
+            if prev_close > 0 and (open_price / prev_close - 1) >= code_limit:
+                print(f"[{_now_str()}] [策略T] [DBG-T] {code} 涨跌停跳过(limit={code_limit:.1%}) "
                       f"open={open_price:.2f} prev_close={prev_close:.2f}")
                 executed.append(code)
                 continue
@@ -454,6 +461,14 @@ class StrategyTEngine:
             # 价格过滤
             if not (T_MIN_PRICE <= today_close <= T_MAX_PRICE):
                 continue
+
+            # ST过滤: 近5日无停牌(成交量>0)
+            hist = df[df['date'] < today_dt]
+            if len(hist) < 5:
+                continue
+            recent_5d_vol = hist['volume'].iloc[-5:]
+            if (recent_5d_vol <= 0).any():
+                continue  # 近5日有停牌，跳过
 
             # 流动性过滤：20 日均成交额 > 3 亿
             recent = df[df['date'] <= today_dt].tail(22)
