@@ -22,6 +22,30 @@ from datetime import datetime, date
 
 sys.path.insert(0, 'd:/miniqmt_quant')
 
+
+# ── stdout 双写（控制台 + 日志文件） ──
+class _TeeWriter:
+    """将 stdout 同时写入控制台和日志文件"""
+    def __init__(self, log_path):
+        self._console = sys.__stdout__
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, 'a', encoding='utf-8', buffering=1)
+
+    def write(self, text):
+        self._console.write(text)
+        self._file.write(text)
+
+    def flush(self):
+        self._console.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+# 启动日志文件（在 main() 中初始化）
+_tee = None
+
 # ───────────────────────────────────────────────────────────
 # 路径常量（与 live_engine_v4.py 保持一致）
 # ───────────────────────────────────────────────────────────
@@ -281,6 +305,13 @@ def main():
         return
 
     # ── 正常启动实盘 ──
+    # 启用 stdout 双写（控制台 + 日志文件）
+    global _tee
+    log_dir = os.path.join(BASE_DIR, 'logs')
+    log_file = os.path.join(log_dir, f'live_v4_{date.today().strftime("%Y%m%d")}.log')
+    _tee = _TeeWriter(log_file)
+    sys.stdout = _tee
+    print(f"[日志] 实盘日志已启用: {log_file}")
     try:
         import config as _cfg
         account_id = getattr(_cfg, 'ACCOUNT_ID', '')
@@ -311,9 +342,6 @@ def main():
 
     try:
         engine = LiveEngineV4(account_id=account_id, xt_path=xt_path)
-        # ↑ capital 不需要传：_load_state 会从 state_v4.json 读取 initial_capital，
-        #   如果 state 文件不存在（首次启动）则 _load_state 会用构造参数默认値 300K。
-        #   如需自定义资金，请先运行： python run_live_v4.py --init --capital 500000
         engine.run()
 
         # ── 收盘后流程 ──
@@ -329,6 +357,12 @@ def main():
         print(f"\n[错误] 运行异常: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # 关闭日志文件
+        if _tee:
+            sys.stdout = sys.__stdout__
+            _tee.close()
+            print(f"[日志] 实盘日志已关闭: {log_file}")
 
 
 def _run_postmarket(engine=None, force_ba: bool = False, skip_wait: bool = False, force_daily: bool = False):
@@ -396,6 +430,51 @@ def _run_postmarket(engine=None, force_ba: bool = False, skip_wait: bool = False
             import traceback
             print(f"[收盘后] BA pool 预算失败（不影响今日交易）: {e}")
             traceback.print_exc()
+
+    # ── 预测明日买入候选 + 钉钉推送 ──
+    print("\n" + "=" * 60)
+    print("[收盘后] 预测明日买入候选...")
+    print("=" * 60)
+    try:
+        from check_monday_candidates import predict_next_day_candidates
+        _pool_file = os.path.join(BASE_DIR, f'ba_pool_v4_{date.today().strftime("%Y-%m-%d")}.json')
+        if os.path.exists(_pool_file):
+            _pred = predict_next_day_candidates(_pool_file)
+            _cands = _pred.get('candidates', [])
+            _regime = _pred.get('regime', '?')
+            _max_pos = _pred.get('max_positions', 0)
+
+            if _cands and _max_pos > 0:
+                _lines = [f"  {c['code']} {c['type']} "
+                          f"现价{c['price']:.2f} 20日{c['ret_20d']*100:.0f}% "
+                          f"量比{c['vol_ratio']:.2f}x"
+                          for c in _cands]
+                _msg = (f'【量化 明日买入候选（{_pred["ref_date"]}池）】\n'
+                        f'Regime: {_regime} (最多{_max_pos}仓)\n'
+                        f'候选: {len(_cands)} 只\n'
+                        + '\n'.join(_lines)
+                        + f'\n\n过滤统计: {_pred["filter_stats"]}')
+            elif _max_pos == 0:
+                _msg = (f'【量化 明日买入候选（{_pred["ref_date"]}池）】\n'
+                        f'Regime: {_regime} → 空仓(禁止买入)\n'
+                        f'盘前通过: {len(_cands)}只，但regime限制无法操作\n'
+                        f'过滤统计: {_pred["filter_stats"]}')
+            else:
+                _msg = (f'【量化 明日买入候选（{_pred["ref_date"]}池）】\n'
+                        f'Regime: {_regime}\n'
+                        f'无候选通过盘前过滤\n'
+                        f'过滤统计: {_pred["filter_stats"]}')
+
+            from utils.notifier import _do_send
+            _do_send(_msg)
+            print(f"[收盘后] 明日候选: {len(_cands)}只, regime={_regime}")
+            print("[收盘后] 钉钉通知已发送 ✓")
+        else:
+            print(f"[收盘后] BA pool 文件不存在: {_pool_file}，跳过预测")
+    except Exception as e:
+        import traceback
+        print(f"[收盘后] 明日候选预测失败（不影响交易）: {e}")
+        traceback.print_exc()
 
     # ── T/C1 信号检测 + 钉钉通知 ──
     print("\n" + "=" * 60)

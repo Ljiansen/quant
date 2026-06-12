@@ -25,6 +25,14 @@ except Exception:
     _xtdata = None
     _XTDATA_OK = False
 
+# 引擎参数（用于读取 COOL_RET_MAX 等常量）
+try:
+    from engine import live_engine_v4 as _v4_mod
+    _ENGINE_OK = True
+except Exception:
+    _v4_mod = None
+    _ENGINE_OK = False
+
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,9 +59,9 @@ def _check_overheat_local(bare_code: str) -> tuple:
     global _overheat_cache, _overheat_cache_date
     import pandas as _pd_oh
 
-    # 引擎内置参数（不再依赖 config.py）
+    # 引擎内置参数（从 live_engine_v4 读取，保持一致）
     lookback  = 20    # 近20日
-    threshold = 0.40  # 累计涨幅超40%视为过热
+    threshold = getattr(_v4_mod, 'COOL_RET_MAX', 1) if _ENGINE_OK else 1  # 与引擎同步，默认1=100%（≈关闭）
 
     # 按日重置缓存
     today_str = _dt_now.today().strftime('%Y%m%d')
@@ -786,6 +794,7 @@ def create_app():
                     'ba_min_chg':    getattr(_v4, 'BA_MIN_CHG',    0.01),
                     'ba_max_chg':    getattr(_v4, 'BA_MAX_CHG',    0.07),
                     'cool_lookback': getattr(_v4, 'COOL_DAYS_MAX', 20),
+                    'cool_ret_max':  getattr(_v4, 'COOL_RET_MAX',  1),
                 },
                 'fees': {
                     'commission_rate': getattr(_v4, 'COMMISSION_RATE', 0.0000854),

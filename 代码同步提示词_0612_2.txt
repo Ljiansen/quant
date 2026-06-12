@@ -1,0 +1,105 @@
+代码同步提示词_0612_2.txt
+========================
+
+本次修改涉及 4 个文件，请逐一确认并同步：
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. check_monday_candidates.py（重写）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+改动：从一次性脚本重构为可复用模块
+- 核心函数 predict_next_day_candidates(ba_pool_path) → 返回 dict
+- 支持 import 调用，也支持命令行运行
+- 命令行自动找最新 ba_pool_v4_*.json 或手动指定路径
+- 包含完整过滤链：流动性→趋势→过热→量比→弱市低动量
+- 包含上证指数 regime 推算（与 _g34_regime_decide 对齐）
+- vol_30d 计算方式：30日 log return 的 std（不年化，阈值 0.022）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. run_live_v4.py（新增段落）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+改动：BA pool 预算完成后，自动预测明日候选 + 钉钉推送
+位置：在 "预算明日 BA pool" 段之后、"T/C1 信号检测" 段之前
+逻辑：
+  - 加载当日 ba_pool_v4_{today}.json
+  - 调用 predict_next_day_candidates() 获取结果
+  - 根据 regime + 候选数量生成不同格式消息
+  - 用 _do_send() 同步发送钉钉（确保进程退出前发出）
+  - 异常不影响交易主流程
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. utils/notifier.py（新增 2 个函数）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+新增信号级通知函数（信号触发即推送，不等成交结果）：
+
+def notify_buy_signal(code, price, change_pct, hm='', regime='')
+  → 【量化交易 · 买入信号 📈】
+
+def notify_sell_signal(code, price, reason, days_held=0, pnl_pct=0, hm='')
+  → 【量化交易 · 卖出信号 🔔/🔻】
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. engine/live_engine_v4.py（多处修改）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A. 导入区新增：
+   from utils.notifier import notify_buy_signal as _notify_buy_signal
+   from utils.notifier import notify_sell_signal as _notify_sell_signal
+   from utils.notifier import notify_pending_sell as _notify_pending_sell
+
+B. 修复 _notify_buy 调用参数（原参数不匹配导致异常被吞）：
+   旧: _notify_buy(code=code, price=actual_px, qty=qty)
+   新: _notify_buy(code=code, price=actual_px, volume=qty,
+                   amount=actual_px * qty, change_pct=_chg_pct)
+
+C. 修复 _notify_sell 调用参数：
+   旧: _notify_sell(code=code, price=fill_price, qty=qty, reason=reason, pnl=pnl)
+   新: _notify_sell(code=code, price=fill_price, volume=qty,
+                    sell_type=reason, buy_price=_buy_px,
+                    days_held=pos.get('days_held', 0), profit_pct=_pnl_pct)
+
+D. 买入信号通知（_process_hm 买入扫描，信号条件通过后、下单之前）：
+   if _NOTIFIER_OK:
+       _notify_buy_signal(code, price=bar['close'],
+                          change_pct=current_chg*100,
+                          hm=..., regime=self.cur_regime)
+
+E. 卖出信号通知（_process_hm 持仓监控，sell_now 触发时、_execute_sell 之前）：
+   if _NOTIFIER_OK:
+       _notify_sell_signal(code, price=sell_price, reason=reason,
+                           days_held=..., pnl_pct=..., hm=...)
+
+F. 14:55 收盘前信号通知（_process_hm_1455）：
+   - sell_now_close → _notify_sell_signal
+   - add_pending → _notify_pending_sell
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bug 根因说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+之前买入/卖出钉钉通知没收到，根因是参数不匹配：
+- notify_buy 签名需要 (code, price, volume, amount, change_pct)
+  但引擎传的是 (code, price, qty) → TypeError 被 except 静默吞掉
+- notify_sell 签名需要 (code, price, volume, sell_type, buy_price, days_held, profit_pct)
+  但引擎传的是 (code, price, qty, reason, pnl) → 同上
+
+修复后：
+- 成交通知：参数已对齐，能正常发出
+- 信号通知：新增，信号触发即推送（不管后续是否因qty=0/资金不足/委托失败而未成交）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. 过热保护注释修复 + Dashboard 同步修复
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A. engine/live_engine_v4.py 注释修复：
+   L12: COOL_RET_MAX=40%  →  COOL_RET_MAX=100%(≈关闭)
+   L131: # 近20日累计>40%入队
+         → # 近20日累计>100%才入冷却队列（≈关闭过热保护；原值0.4即40%会吃掉大量利润）
+
+B. dashboard/app.py 过热阈值同步修复：
+   旧: threshold = 0.40  # 硬编码40%，与引擎实际值(1=100%)不一致
+   新: threshold = getattr(_v4_mod, 'COOL_RET_MAX', 1) if _ENGINE_OK else 1
+   - 新增引擎模块导入: from engine import live_engine_v4 as _v4_mod
+   - config API 新增: cool_ret_max 字段
+
+说明：引擎 COOL_RET_MAX=1 即100%，等价于关闭过热保护。
+Dashboard 之前硬编码 0.40(40%)，导致前端显示"过热"的股票
+在引擎里其实并不会被过滤，造成展示与实际行为不一致。

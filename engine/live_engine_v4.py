@@ -9,7 +9,7 @@ V4策略实盘引擎 —— OPT-bull (BA选股 + 5min入场 + V3 trail/hs出场 
   MAX_POSITIONS=5(Bull)/4(Chop), HARD_STOP=6.5%,
   TRAIL_ACT=40%(Bull)/25%(Chop), TRAIL_STOP=12%(Bull)/8%(Chop)
   MIN_CHG主板=1%, MAX_CHG主板=3.5%, STAR_MIN=0.1%, STAR_MAX=5.5%
-  VOL_RATIO=[1.5,3.0], GAP_MIN=+0.5%(今开>昨收), COOL_RET_MAX=40%, BA_CHG=[1%,7%]
+  VOL_RATIO=[1.5,3.0], GAP_MIN=+0.5%(今开>昨收), COOL_RET_MAX=100%(≈关闭), BA_CHG=[1%,7%]
   COMMISSION=万0.854, STAMP=千0.5, SLIPPAGE=0.015%
 """
 
@@ -59,6 +59,9 @@ try:
     from utils.notifier import notify_buy as _notify_buy
     from utils.notifier import notify_sell as _notify_sell
     from utils.notifier import notify_system as _notify_system
+    from utils.notifier import notify_buy_signal as _notify_buy_signal
+    from utils.notifier import notify_sell_signal as _notify_sell_signal
+    from utils.notifier import notify_pending_sell as _notify_pending_sell
     _NOTIFIER_OK = True
 except Exception:
     _NOTIFIER_OK = False
@@ -125,7 +128,7 @@ VOL_RATIO_MAX       = 3.0
 GAP_MIN             = 0.005     # G1: 今开 > 昨收 +0.5% 才入场 (Phase5 对齐)
 
 # 冷却队列
-COOL_RET_MAX        = 1       # 近20日累计>40%入队
+COOL_RET_MAX        = 1       # 近20日累计>100%才入冷却队列（≈关闭过热保护；原值0.4即40%会吃掉大量利润）
 COOL_DAYS_MAX       = 15
 
 # E1 死票早卖
@@ -1200,6 +1203,18 @@ class LiveEngineV4:
             action, reason, sell_price = self._evaluate_intraday_sell(
                 pos, bar, code, i, today_str)
             if action == 'sell_now':
+                # 卖出信号触发通知（不管后续是否成交）
+                if _NOTIFIER_OK:
+                    try:
+                        _bp = pos.get('buy_price', 0)
+                        _pnl_pct = ((sell_price - _bp) / _bp * 100) if _bp > 0 else 0
+                        _notify_sell_signal(code=code, price=sell_price,
+                                            reason=reason,
+                                            days_held=pos.get('days_held', 0),
+                                            pnl_pct=_pnl_pct,
+                                            hm=f"{hm[0]:02d}:{hm[1]:02d}")
+                    except Exception:
+                        pass
                 self._execute_sell(code, pos, sell_price, reason, today_str, hm=hm)
 
         # 买入扫描（9:35起，14:55含）
@@ -1292,6 +1307,16 @@ class LiveEngineV4:
                       f"above_open={bar['close']>today_open} "
                       f"limit_up={_limit_up(code):.2%}")
                 continue
+
+            # 买入信号触发通知（不管后续是否成交）
+            if _NOTIFIER_OK:
+                try:
+                    _notify_buy_signal(code=code, price=bar['close'],
+                                       change_pct=current_chg * 100,
+                                       hm=f"{hm[0]:02d}:{hm[1]:02d}",
+                                       regime=self.cur_regime)
+                except Exception:
+                    pass
 
             # 下单（V3风格实时价路由：优先卖一价，避免无谓加价）
             buy_px = bar['close']
@@ -1476,8 +1501,27 @@ class LiveEngineV4:
 
             action, reason, sell_price = self._evaluate_close_signals(pos, bar, code)
             if action == 'sell_now_close':
+                # 卖出信号通知
+                if _NOTIFIER_OK:
+                    try:
+                        _bp = pos.get('buy_price', 0)
+                        _pnl_pct = ((sell_price - _bp) / _bp * 100) if _bp > 0 else 0
+                        _notify_sell_signal(code=code, price=sell_price,
+                                            reason=reason,
+                                            days_held=pos.get('days_held', 0),
+                                            pnl_pct=_pnl_pct, hm='14:55')
+                    except Exception:
+                        pass
                 self._execute_sell(code, pos, sell_price, reason, today_str, hm=(14, 55))
             elif action == 'add_pending':
+                # pending卖出信号通知
+                if _NOTIFIER_OK:
+                    try:
+                        _notify_pending_sell(code=code, sell_type=reason,
+                                             days_held=pos.get('days_held', 0),
+                                             last_price=bar['close'])
+                    except Exception:
+                        pass
                 self.pending_sells.append({
                     'code': code, 'quantity': pos['quantity'], 'sell_type': reason})
 
@@ -1624,8 +1668,8 @@ class LiveEngineV4:
                 invalid_codes.add(code)
                 continue
 
-            ok = self._place_sell_order(code, qty, limit_price)
-            if ok:
+            sell_r = self._place_sell_order(code, qty, limit_price)
+            if sell_r.get('ok'):
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] pending卖出挂单: {code} "
                       f"限价={limit_price:.3f} 数量={qty} 原因={sell_type}")
                 # P0-1: 标记已提交委托，不移除（防止委托未成交时状态错乱）
@@ -1754,7 +1798,10 @@ class LiveEngineV4:
               f"价={actual_px:.3f} 数量={qty} 佣金={commission:.2f} 现金剩余={self.cash:.2f}")
         if _NOTIFIER_OK:
             try:
-                _notify_buy(code=code, price=actual_px, qty=qty)
+                _prev_c = self.prev_close_cache.get(code, 0)
+                _chg_pct = ((actual_px - _prev_c) / _prev_c * 100) if _prev_c > 0 else 0
+                _notify_buy(code=code, price=actual_px, volume=qty,
+                            amount=actual_px * qty, change_pct=_chg_pct)
             except Exception:
                 pass
         self._save_state(force=True)  # P2-2: 买入为关键事件，强制写盘
@@ -1810,23 +1857,27 @@ class LiveEngineV4:
             return
 
         # V3风格实时价路由：止损用买一价，确保快速成交；降级用 sell_price - SLIPPAGE
-        actual_sell = self._route_sell_price(code, sell_price)
-        ok = self._place_sell_order(code, qty, actual_sell)
-        if not ok:
+        order_price = self._route_sell_price(code, sell_price)
+        sell_result = self._place_sell_order(code, qty, order_price)
+        if not sell_result.get('ok'):
             return
 
-        # 用实际成交价计算净收入和盈亏（而非信号价）
-        net, commission, stamp_tax = _sell_net(actual_sell, qty)
+        # 真实成交价：优先用 query_stock_trades 返回的加权均价，降级用路由价
+        fill_price = sell_result.get('fill_price') or order_price
+        fill_source = '券商成交' if sell_result.get('fill_price') else '路由价'
+
+        # 用真实成交价计算净收入和盈亏
+        net, commission, stamp_tax = _sell_net(fill_price, qty)
         pnl = net - pos['buy_price'] * qty
 
         self.cash += net
-        slip_amt = round(sell_price - actual_sell, 4)
-        self._log_trade('sell', code, actual_sell, qty, reason,
+        slip_amt = round(sell_price - fill_price, 4)
+        self._log_trade('sell', code, fill_price, qty, reason,
                         fee=commission + stamp_tax, pnl=pnl,
                         cash_after=self.cash,
                         days_held=pos.get('days_held', 0),
                         signal_px=round(sell_price, 4),
-                        order_px=round(actual_sell, 4),
+                        order_px=round(order_price, 4),
                         slippage_amt=slip_amt,
                         slippage_pct=round(slip_amt / sell_price, 6) if sell_price else 0,
                         trigger_hm=f"{hm[0]:02d}:{hm[1]:02d}" if hm else None,
@@ -1841,12 +1892,16 @@ class LiveEngineV4:
         del self.positions[code]
 
         print(f"[{_now_str()}] [{self.ENGINE_NAME}] 卖出: {code} "
-              f"原因={reason} 成交价={actual_sell:.3f}(信号{sell_price:.3f}) 数量={qty} "
-              f"PnL={pnl:+.2f} 现金={self.cash:.2f}")
+              f"原因={reason} 成交价={fill_price:.3f}({fill_source},委托{order_price:.3f},信号{sell_price:.3f}) "
+              f"数量={qty} PnL={pnl:+.2f} 现金={self.cash:.2f}")
         if _NOTIFIER_OK:
             try:
-                _notify_sell(code=code, price=actual_sell, qty=qty,
-                             reason=reason, pnl=pnl)
+                _buy_px = pos.get('buy_price', 0)
+                _pnl_pct = (pnl / (_buy_px * qty) * 100) if (_buy_px > 0 and qty > 0) else 0
+                _notify_sell(code=code, price=fill_price, volume=qty,
+                             sell_type=reason, buy_price=_buy_px,
+                             days_held=pos.get('days_held', 0),
+                             profit_pct=_pnl_pct)
             except Exception:
                 pass
         self._save_state(force=True)  # P2-2: 卖出为关键事件，强制写盘
@@ -2157,12 +2212,15 @@ class LiveEngineV4:
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 买入委托失败: {code} — {detail}")
             return False
 
-    def _place_sell_order(self, code: str, qty: int, price: float) -> bool:
+    def _place_sell_order(self, code: str, qty: int, price: float) -> dict:
+        """卖出委托，返回 {ok, fill_price, fill_volume}。
+        fill_price: 真实加权成交均价（query_stock_trades），未成交时为 None。
+        """
         if not _XT_OK or not _EXECUTOR_OK:
             if self.account_id:
                 raise RuntimeError(
                     f"xtquant 不可用，实盘拒绝卖出委托 {code}（避免假装下单）")
-            return True  # 回测模式
+            return {'ok': True}  # 回测模式
         import time as _time
         _MAX_ATTEMPTS = 2
         _RETRY_WAIT   = 2.0
@@ -2175,9 +2233,12 @@ class LiveEngineV4:
             ok  = r.get('ok', False)
             err = r.get('error', '')
             if ok:
+                fill_px = r.get('fill_price')
+                fill_vol = r.get('fill_volume')
+                fill_info = f" 真实成交={fill_px}(共{fill_vol}股)" if fill_px else ""
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] ✅ 卖出委托确认: "
-                      f"{code} order_id={oid} 已进入QMT委托列表")
-                return True
+                      f"{code} order_id={oid} 已进入QMT委托列表{fill_info}")
+                return {'ok': True, 'fill_price': fill_px, 'fill_volume': fill_vol}
             if 'connect failed' in err and _attempt < _MAX_ATTEMPTS:
                 print(f"[{_now_str()}] [{self.ENGINE_NAME}] ⚠️ 连接失败，"
                       f"等待{_RETRY_WAIT:.0f}s后重试 ({_attempt}/{_MAX_ATTEMPTS})...")
@@ -2185,7 +2246,7 @@ class LiveEngineV4:
                 continue
             detail = err if err else f"order_id={oid}"
             print(f"[{_now_str()}] [{self.ENGINE_NAME}] ❌ 卖出委托失败: {code} — {detail}")
-            return False
+            return {'ok': False}
 
     # ─────────────────────────────────────────────
     # 状态持久化

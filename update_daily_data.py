@@ -18,10 +18,12 @@
 import os
 import sys
 import time
+import json
 import random
 import argparse
 import logging
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
 
@@ -38,11 +40,30 @@ LOG_FILE   = 'd:/miniqmt_quant/logs/update_daily_data.log'
 DELAY_MIN  = 0.05
 DELAY_MAX  = 0.15
 
+# baostock 单次请求超时（秒）和重试次数
+BS_TIMEOUT = 30
+BS_MAX_RETRIES = 3
+
 # 项目根目录（用于定位 state_v4.json 等文件）
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 
+# 失败股票记录文件
+FAILED_FILE = os.path.join(BASE_DIR, 'logs', 'daily_update_failed.json')
+
 # CSV 列名（与现有本地数据保持一致，volumn 是 xtquant 原始拼写）
 CSV_COLS   = ['timetag', 'open', 'high', 'low', 'close', 'volumn', 'amount']
+
+# ── 超时包装 ──
+_executor = ThreadPoolExecutor(max_workers=1)
+
+def _run_with_timeout(fn, timeout=BS_TIMEOUT, desc=''):
+    """在线程池中执行 fn()，超时抛出 FuturesTimeoutError"""
+    future = _executor.submit(fn)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        log.warning(f'  ⏱️  超时({timeout}s): {desc}')
+        raise
 
 # ──────────────────────────────────────────────────────────────
 # 日志初始化
@@ -136,6 +157,7 @@ def fetch_bs_hist(code: str, start_yyyymmdd: str, end_yyyymmdd: str) -> pd.DataF
     通过 baostock 获取单只股票前复权日线数据。
     返回格式与本地 CSV 一致：timetag(int), open, high, low, close, volumn, amount
     注意：baostock volume 单位为股，需除以 100 转为手（与 xtquant/本地 CSV 一致）
+    支持 BS_TIMEOUT 超时 + BS_MAX_RETRIES 次重试，失败返回空 DataFrame。
     """
     import baostock as bs
 
@@ -147,49 +169,54 @@ def fetch_bs_hist(code: str, start_yyyymmdd: str, end_yyyymmdd: str) -> pd.DataF
     # 股票代码转 baostock 格式
     bs_code = f'sh.{code}' if code.startswith('6') else f'sz.{code}'
 
-    for attempt in range(1, 4):
+    for attempt in range(1, BS_MAX_RETRIES + 1):
         try:
-            _bs_ensure_login()
-            rs = bs.query_history_k_data_plus(
-                code=bs_code,
-                fields='date,open,high,low,close,volume,amount',
-                start_date=start,
-                end_date=end,
-                frequency='d',
-                adjustflag='2',  # 前复权
-            )
-            if rs.error_code != '0':
-                raise RuntimeError(f'baostock 查询错误: {rs.error_msg}')
+            def _do_query():
+                _bs_ensure_login()
+                rs = bs.query_history_k_data_plus(
+                    code=bs_code,
+                    fields='date,open,high,low,close,volume,amount',
+                    start_date=start,
+                    end_date=end,
+                    frequency='d',
+                    adjustflag='2',  # 前复权
+                )
+                if rs.error_code != '0':
+                    raise RuntimeError(f'baostock 查询错误: {rs.error_msg}')
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                return rows, rs.fields if rows else None
 
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
+            rows, fields = _run_with_timeout(_do_query, timeout=BS_TIMEOUT,
+                                              desc=f'{code}({start}~{end})')
 
             if not rows:
                 return pd.DataFrame()
 
-            df = pd.DataFrame(rows, columns=rs.fields)
-
-            # 日期 'YYYY-MM-DD' → YYYYMMDD 整数
+            df = pd.DataFrame(rows, columns=fields)
             df['timetag'] = df['date'].str.replace('-', '', regex=False).astype(int)
-
-            # 数值类型
             for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-
-            # baostock volume(股) ÷ 100 → volumn(手)，与本地 CSV 保持一致
             df['volumn'] = df['volume'] / 100.0
-
             df = df[CSV_COLS].copy()
             return df
 
-        except Exception as e:
+        except FuturesTimeoutError:
             global _bs_logged_in
-            _bs_logged_in = False  # 下次重新登录
-            if attempt < 3:
+            _bs_logged_in = False  # 超时后 baostock 状态不可信，重新登录
+            if attempt < BS_MAX_RETRIES:
+                wait = 1.0 * attempt + random.random()
+                log.warning(f'  {code} 第{attempt}次超时，等待{wait:.1f}s后重试')
+                time.sleep(wait)
+            else:
+                log.error(f'  {code} 获取失败（已重试{BS_MAX_RETRIES}次均超时）')
+        except Exception as e:
+            _bs_logged_in = False
+            if attempt < BS_MAX_RETRIES:
                 time.sleep(1.0 * attempt + random.random())
             else:
-                log.debug(f'  {code} 获取失败（已重试3次）: {e}')
+                log.error(f'  {code} 获取失败（已重试{BS_MAX_RETRIES}次）: {e}')
     return pd.DataFrame()
 
 
@@ -300,43 +327,52 @@ def update_sh_index(start_yyyymmdd: str, end_yyyymmdd: str) -> bool:
 
 def update_existing(codes: list[str], start_yyyymmdd: str,
                     end_yyyymmdd: str,
-                    skip_codes: set = None) -> tuple[int, int, int]:
+                    skip_codes: set = None) -> dict:
     """
     批量更新已有股票 CSV 文件。
     skip_codes: 跳过的股票集合（如除权股票，将单独全量重下）
-    返回 (success, skipped, failed)
+    返回 {success, up_to_date, no_data, ex_rights, failed, failed_codes}
     """
     total   = len(codes)
     success = 0
-    skipped = 0
+    up_to_date = 0   # 本地已有最新数据
+    no_data = 0      # baostock 无新数据（停牌/未上市）
+    ex_rights = 0    # 除权跳过
     failed  = 0
+    failed_codes = []
     skip_codes = skip_codes or set()
 
     for i, code in enumerate(codes, 1):
         if code in skip_codes:
-            skipped += 1
+            ex_rights += 1
             continue
 
-        if i % 100 == 0 or i == 1 or i == total:
-            log.info(f'  进度: {i}/{total}  成功={success} 跳过={skipped} 失败={failed}')
+        if i % 20 == 0 or i == 1 or i == total:
+            log.info(f'  进度: {i}/{total}  更新={success} 已最新={up_to_date}'
+                     f' 无数据={no_data} 失败={failed}')
 
         try:
             new_df = fetch_bs_hist(code, start_yyyymmdd, end_yyyymmdd)
             if new_df.empty:
-                skipped += 1
+                no_data += 1
             else:
                 added = append_new_rows(code, new_df)
                 if added > 0:
                     success += 1
                 else:
-                    skipped += 1
+                    up_to_date += 1
         except Exception as e:
-            log.debug(f'  {code} 处理异常: {e}')
+            log.warning(f'  {code} 处理异常: {e}')
             failed += 1
+            failed_codes.append(code)
 
         time.sleep(DELAY_MIN + random.random() * (DELAY_MAX - DELAY_MIN))
 
-    return success, skipped, failed
+    return {
+        'success': success, 'up_to_date': up_to_date,
+        'no_data': no_data, 'ex_rights': ex_rights,
+        'failed': failed, 'failed_codes': failed_codes,
+    }
 
 
 def add_new_stocks(start_yyyymmdd: str, end_yyyymmdd: str,
@@ -620,12 +656,33 @@ def main():
     log.info(f'预计耗时: ~{est_min} 分钟')
 
     t0 = time.time()
-    success, skipped, failed = update_existing(codes, start_date, end_date,
-                                               skip_codes=ex_rights_codes)
+    result = update_existing(codes, start_date, end_date, skip_codes=ex_rights_codes)
     elapsed = (time.time() - t0) / 60
 
     _bs_logout()
-    log.info(f'增量更新完成: 成功={success} 跳过={skipped} 失败={failed}，耗时 {elapsed:.1f} 分钟')
+    log.info(f'增量更新完成: 更新={result["success"]} 已最新={result["up_to_date"]}'
+             f' 无数据={result["no_data"]} 除权跳过={result["ex_rights"]}'
+             f' 失败={result["failed"]}，耗时 {elapsed:.1f} 分钟')
+
+    # ── 记录失败股票 ──
+    failed_codes = result['failed_codes']
+    if failed_codes:
+        os.makedirs(os.path.dirname(FAILED_FILE), exist_ok=True)
+        fail_record = {
+            'date': end_date,
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'count': len(failed_codes),
+            'codes': failed_codes,
+        }
+        with open(FAILED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(fail_record, f, ensure_ascii=False, indent=2)
+        log.warning(f'⚠️  {len(failed_codes)} 只股票失败，已记录到 {FAILED_FILE}')
+        log.warning(f'    失败列表: {failed_codes[:20]}{"..." if len(failed_codes) > 20 else ""}')
+        log.info('    可重新运行脚本进行补下（幂等保护）')
+    else:
+        # 全部成功时清除旧的失败记录
+        if os.path.exists(FAILED_FILE):
+            os.remove(FAILED_FILE)
 
     # ── Step 3: 上证指数更新 ──
     log.info('── 更新上证指数 ──')

@@ -63,17 +63,40 @@ def main():
         orders = ex._trader.query_stock_orders(ex._account, cancelable_only=False)
         found_ids = [getattr(o, 'order_id', None) for o in (orders or [])]
         found = oid in found_ids
-        print(json.dumps({
+        result = {
             'ok': found,
             'oid': oid,
             'n_orders': len(found_ids),
             'found_ids': found_ids,
             'found': found,
-        }))
+        }
     except Exception as e:
         # 查询异常时保守认为成功（order_stock已返回正ID）
-        print(json.dumps({'ok': True, 'oid': oid, 'error': f'query failed: {e}'}))
+        result = {'ok': True, 'oid': oid, 'error': f'query failed: {e}'}
 
+    # 卖出时查询真实成交价（加权均价）
+    if action == 'sell':
+        try:
+            trades = ex._trader.query_stock_trades(ex._account)
+            if trades:
+                # 筛选当前 order_id 的成交记录
+                my_trades = [t for t in trades if getattr(t, 'order_id', -1) == oid]
+                if my_trades:
+                    total_vol = sum(getattr(t, 'traded_volume', 0) for t in my_trades)
+                    total_amt = sum(getattr(t, 'traded_volume', 0) * getattr(t, 'traded_price', 0)
+                                    for t in my_trades)
+                    if total_vol > 0:
+                        fill_price = round(total_amt / total_vol, 4)
+                        result['fill_price'] = fill_price
+                        result['fill_volume'] = total_vol
+                        fills = [(getattr(t, 'traded_volume', 0), getattr(t, 'traded_price', 0))
+                                 for t in my_trades]
+                        result['fill_details'] = fills
+                        print(f'[worker] 真实成交: {total_vol}股 @ 均价{fill_price}', file=sys.stderr)
+        except Exception as e:
+            print(f'[worker] 查询成交明细异常: {e}', file=sys.stderr)
+
+    print(json.dumps(result, ensure_ascii=False))
     ex.disconnect()
 
 

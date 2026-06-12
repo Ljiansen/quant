@@ -157,3 +157,46 @@ def notify_system(title: str, body: str, level: str = 'info'):
         f"时间：{_now()}"
     )
     send_notify(content)
+
+
+# ── 信号级通知（信号触发即推送，不管是否成交）──────────────────────────────
+
+def notify_buy_signal(code: str, price: float, change_pct: float,
+                      hm: str = '', regime: str = ''):
+    """买入信号触发通知（信号产生即推送，不等成交结果）"""
+    name = _get_stock_name(code)
+    content = (
+        f"【量化交易 · 买入信号 📈】\n"
+        f"股票：{name}（{code}）\n"
+        f"信号价：{price:.3f} 元\n"
+        f"涨幅：{change_pct:+.2f}%\n"
+        f"Regime：{regime}\n"
+        f"时间：{hm} {_now()}"
+    )
+    send_notify(content)
+
+
+def notify_sell_signal(code: str, price: float, reason: str,
+                       days_held: int = 0, pnl_pct: float = 0,
+                       hm: str = ''):
+    """卖出信号触发通知（信号产生即推送，不等成交结果）"""
+    name = _get_stock_name(code)
+    reason_map = {
+        'hard_stop':     '硬止损',
+        'soft_stop':     '阴跌止损',
+        'trailing_stop': '移动止盈',
+        'time_stop':     '时间止损',
+        'pending':       '竞价卖出',
+    }
+    reason_zh = reason_map.get(reason, reason or '卖出')
+    emoji = '🔻' if pnl_pct < 0 else '🔔'
+    content = (
+        f"【量化交易 · 卖出信号 {emoji}】\n"
+        f"股票：{name}（{code}）\n"
+        f"触发类型：{reason_zh}\n"
+        f"信号价：{price:.3f} 元\n"
+        f"持仓：{days_held} 天\n"
+        f"预估盈亏：{pnl_pct:+.2f}%\n"
+        f"时间：{hm} {_now()}"
+    )
+    send_notify(content)
